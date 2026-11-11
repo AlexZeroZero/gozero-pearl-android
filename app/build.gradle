@@ -1,0 +1,27 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'trade.gozero.pearl'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'trade.gozero.pearl'
+        minSdk 28
+        targetSdk 35
+        versionCode 11
+        versionName '1.0'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    signingConfigs {
+        release {
+            if (System.getenv('BNT_KEYSTORE')) {
+                storeFile file(System.getenv('BNT_KEYSTORE'))
+                storePassword System.getenv('BNT_STORE_PASSWORD')
+                keyAlias 'gozero-bnt'
+                keyPassword System.getenv('BNT_STORE_PASSWORD')
+            }
+        }
+    }
+    buildTypes { release { minifyEnabled false; signingConfig signingConfigs.release } }
+    packaging { jniLibs { useLegacyPackaging = true; keepDebugSymbols += ['**/libpearlminer.so', '**/libpearlgpu.so'] } }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+}
+dependencies { testImplementation 'junit:junit:4.13.2'; testImplementation 'org.json:json:20240303' }

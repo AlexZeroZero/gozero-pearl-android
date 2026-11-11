@@ -1,0 +1,84 @@
+#ifndef CP_POOL_H
+#define CP_POOL_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "cp_config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int cp_pool_connect(const char* host, int port);
+void cp_pool_disconnect(void);
+int cp_pool_socket(void);
+
+/* mining.authorize with wallet/worker/agent (LuckyPool), plus "password"
+ * (custom difficulty "d=N" on Kryptex) and "type":"v2" (Kryptex gzip stratum
+ * offer). Clears the gzip flag; the reader sets it from the response. */
+int cp_pool_send_authorize(int msg_id, const char* wallet,
+                           const char* worker, const char* agent,
+                           const char* password);
+/* Reader-side: pool line with the pending authorize id → parse "type":"v2".
+ * Returns 1 if the line was the authorize response (handled). */
+int cp_pool_on_authorize_response(const char* line);
+/* Nonzero once the last mining.authorize response carried "type":"v2" (Kryptex gzip
+ * stratum): plain_proof must then be submitted gzip-compressed. Thread-safe. */
+int cp_pool_proof_gzip(void);
+int cp_pool_send_plain_proof_submit(int sock, int msg_id, const char* job_id,
+                                    const char* plain_b64, double hs);
+
+void cp_pool_reader_start(void);
+void cp_pool_reader_stop(void);
+void cp_pool_inbox_clear(void);
+
+/* Blocking read of one JSON object (reader must be stopped). 1=ok, 0=timeout, -1=lost */
+int cp_pool_recv_one(char* out, size_t out_cap, int timeout_ms);
+
+/* 1 = line copied, 0 = timeout, -1 = connection lost */
+int cp_pool_wait_line(char* out, size_t out_cap, int timeout_ms);
+int cp_pool_conn_lost(void);
+
+/* A job arrived on this connection: ends the first-job deadline. Reader thread. */
+void cp_pool_note_job(void);
+/* Start the first-job deadline (Quantus: login reply without an embedded job). */
+void cp_pool_expect_job(void);
+/* Difficulty of a mining.set_difficulty line ("params":[D] or "params":D, any
+ * whitespace); 0 if absent or not a positive number. */
+double cp_pool_parse_difficulty(const char* line);
+
+/* Wait for the pool's reply to submit msg_id (call before sending); the connection is
+ * treated as lost when a tracked submit has no reply for 60 s. Untrack after a failed send. */
+void cp_pool_track_submit(int msg_id);
+void cp_pool_untrack_submit(int msg_id);
+void cp_pool_log_share_submit_outcome(int msg_id);
+
+/* Job fields of a mining.notify (cp_pool_notify.cpp). 0 without a header string, and with a
+ * logged reason without a job id that fits job_id, or with a cert_version other than 1..3
+ * (unless --cert-version is forced). The target is copied as sent; callers check it. */
+int cp_pool_parse_notify(const char* json,
+                         char* job_id, int job_len,
+                         char* header_hex, int header_len,
+                         char* target_hex, int target_len,
+                         uint32_t* cert_version_out);
+
+typedef struct {
+    char job_id[128];
+    char job_key[320];
+    char target_hex[80];
+    uint8_t header[INCOMPLETE_HEADER_BYTES];
+    uint32_t tgt[8];
+    uint32_t cert_version; /* 1/2=legacy seeds, 3=salted */
+} CpPendingJob;
+
+int cp_pool_take_pending_job(CpPendingJob* out);
+
+double cp_pool_difficulty(void);
+void cp_pool_set_difficulty(double d);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* CP_POOL_H */

@@ -1,0 +1,68 @@
+{
+  "version": "1.0",
+  "version_code": 11,
+  "application_id": "trade.gozero.pearl",
+  "built_at": "2026-11-11T22:06:02.096399+08:00",
+  "apk_sha256": "107487503736b48e4909df83a206115d0e13a9681b2261c9ee287608bf360c9a",
+  "apk_signature": "v2 verified; same signing certificate as 0.9.1",
+  "apk_alignment": "16 KiB verified",
+  "abi": "arm64-v8a",
+  "minimum_android": "9 / API 28",
+  "jvm_tests": {
+    "tests": 61,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "android_lint": {
+    "Error": 0,
+    "Fatal": 0,
+    "Warning": 26
+  },
+  "native_sha256": {
+    "libpearlgpu.so": "edd733cf4f697092f36692b673af8795ff6ab6076f622459ba8b96c4ef573f83",
+    "libpearlminer.so": "2476e814a50dedd4f9360cc7cfbe2df63cb33c3fda03a3d0f136eddcc9429f20"
+  },
+  "native_identical_to_0_9_1": true,
+  "release_scope": "Version number, displayed version, client identification and publishing documentation only. Mining and thermal algorithms are unchanged.",
+  "prior_device_observation": {
+    "tested_version": "0.9.1",
+    "device": "Samsung S24 Ultra SM-S9280 / Snapdragon 8 Gen 3",
+    "cooling": "No external cooling",
+    "cpu_threads": 7,
+    "matrix": "1K x 128K",
+    "duration_seconds": 596.4689999999246,
+    "workers": {
+      "gpu": {
+        "contribution_GHs": 2.5346304471685723,
+        "accepted": 0,
+        "rejected": 0,
+        "last_180s_GHs": 0.0
+      },
+      "cpu": {
+        "contribution_GHs": 299.62071439298705,
+        "accepted": 1,
+        "rejected": 0,
+        "last_180s_GHs": 282.13345389191846
+      }
+    },
+    "combined_lower_bound_GHs": 302.15534484015564,
+    "method": "cumulative completed MAC units at each unique API port; shared wall interval includes startup, proof check, preparation and thermal pauses",
+    "measurement_limit": "Paused processes are not queried; their last observed work total is a lower bound (up to one sample of extra work before pause may be omitted). No stale GPU rate is extrapolated across pauses.",
+    "gpu_v3_proof_pass": true,
+    "cpu_thermal_pause_events_observed": 9,
+    "balance_ui_sync_verified": true,
+    "limits": [
+      "CPU 92 C",
+      "GPU 90 C",
+      "Battery and Android thermal protections retained"
+    ]
+  },
+  "limitations": [
+    "The approximately 10-minute device observation was performed on 0.9.1, not newly repeated on 1.0.",
+    "Version 1.0 reuses byte-identical native workers and the same scheduling/thermal logic.",
+    "Thermal pauses remain; exceeding the afternoon build or GT5 sustained rate has not been demonstrated.",
+    "GPU V3 proof passed locally; no accepted GPU pool share was captured in that observation.",
+    "PearlHash mining protocol is not supported; its account data query is available."
+  ]
+}

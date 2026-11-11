@@ -1,0 +1,196 @@
+#ifndef CP_NOISE_H
+#define CP_NOISE_H
+
+#ifdef __cplusplus
+#include <cstddef>
+#else
+#include <stddef.h>
+#endif
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern const uint8_t PEARL_SCATTERED_CONFIG[52];
+extern const uint8_t PEARL_CONTIGUOUS_CONFIG[52];
+extern const uint8_t PEARL_CONTIGUOUS_8x8_CONFIG[52];
+extern const uint8_t PEARL_CONTIGUOUS_4x8_CONFIG[52];
+extern const uint8_t PEARL_CONTIGUOUS_16x16_CONFIG[52];
+extern const uint8_t PEARL_CONTIGUOUS_4x64_CONFIG[52];
+/* Case 7.1 epilogue scatter: 16 A rows x 8 B cols per hash tile. */
+extern const uint8_t PEARL_CUTLASS_CONFIG[52];
+
+void pearl_set_cutlass_fused(int on);
+
+extern const uint8_t PEARL_SEED_LABEL_A[32];
+extern const uint8_t PEARL_SEED_LABEL_B[32];
+
+void pearl_set_contiguous_tiles(int on);
+void pearl_set_contiguous_tile_width(int w);
+void pearl_set_contiguous_tile_shape(int mr, int w);
+
+int pearl_generate_ab(const uint8_t* seed, int seed_len, int m, int n, int k,
+                      int8_t* A_out, int8_t* Bt_out);
+
+/* Miner-chosen random A in [-64, 63] (CUDA cp_gen_random_matrix_kernel compatible). */
+int pearl_generate_random_a(const uint8_t* seed, int seed_len, int m, int k,
+                            int8_t* A_out);
+
+/* Row A refresh (every backend): rewrite one random row with the values
+ * pearl_generate_random_a gives it for this seed; *row_out (may be NULL) gets the row.
+ * The rest of A must already be in [-64, 63], e.g. zeroed or from pearl_generate_random_a. */
+int pearl_fill_random_a_row(const uint8_t* seed, int seed_len, int m, int k, int8_t* A_inout,
+                            int* row_out);
+
+/* Sparse A refresh: one random in-range write per column (row and value from seed).
+ * Leaves other entries untouched — caller must ensure A starts in [-64, 63] (e.g. zeros). */
+int pearl_perturb_random_a_one_per_col(const uint8_t* seed, int seed_len, int m, int k,
+                                       int8_t* A_inout);
+/* Same, also writing the k byte offsets it wrote (offsets_out[j] for column j; may be NULL). */
+int pearl_perturb_random_a_one_per_col_ex(const uint8_t* seed, int seed_len, int m, int k,
+                                          int8_t* A_inout, uint64_t* offsets_out);
+
+/* Incremental keyed Merkle digest of a matrix: the same value as pearl_keyed_digest_int8,
+ * but it keeps every chunk chaining value and every complete parent of the BLAKE3 tree, so
+ * after a few bytes change only the touched chunks and their ancestors are hashed again.
+ * The first call, or a call with another key, length or buffer, hashes everything. */
+typedef struct PearlMatrixHash PearlMatrixHash;
+PearlMatrixHash* pearl_matrix_hash_create(void);
+void pearl_matrix_hash_free(PearlMatrixHash* h);
+void pearl_matrix_hash_invalidate(PearlMatrixHash* h);
+/* dirty_offsets: byte offsets changed since the previous call on the same buffer (ignored
+ * on a full rebuild). Returns 0 on success; *rehashed_chunks (may be NULL) gets the number
+ * of chunks hashed. */
+int pearl_matrix_hash_digest(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                             const uint8_t key[32], const uint64_t* dirty_offsets,
+                             size_t n_dirty, uint8_t out[32], size_t* rehashed_chunks);
+/* Rebuild h from chunk chaining values computed elsewhere (e.g. on a DSP: 32 bytes per
+ * 1 KB chunk, in order) for the matrix at mat (may be NULL for a matrix that will not be
+ * updated, e.g. an all-zero one), and return the root, as pearl_keyed_digest_int8 would. */
+int pearl_matrix_hash_from_cvs(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                               const uint8_t key[32], const uint8_t* chunk_cvs, uint8_t out[32]);
+/* A whole tree computed elsewhere (the Hexagon DSP's pearlx tree_cvs): level j (0 = the
+ * chunk chaining values) holds the num_chunks >> j complete nodes of 32 bytes, starting at
+ * node pearl_matrix_tree_level_offset(num_chunks, j) (each level padded to 4 nodes, 128
+ * bytes), for every level with at least 2 nodes. pearl_matrix_tree_nodes is the total. */
+size_t pearl_matrix_tree_level_offset(size_t num_chunks, int level);
+size_t pearl_matrix_tree_nodes(size_t num_chunks);
+/* The root from such a tree, as pearl_keyed_digest_int8 would give it. h NULL: read the
+ * tree in place (nothing kept). h given: h takes a copy of the tree, so later
+ * pearl_matrix_hash_digest calls on mat are incremental. */
+int pearl_matrix_hash_from_tree(PearlMatrixHash* h, const int8_t* mat, size_t raw_len,
+                                const uint8_t key[32], const uint8_t* tree, uint8_t out[32]);
+
+int pearl_effective_seed(const uint8_t* header, int header_len, uint64_t nonce,
+                         uint8_t* out, int out_cap);
+
+void pearl_job_key(const uint8_t* header, int header_len, uint8_t out32[32]);
+
+/* Cert V3: blake3(root || dim_le32 || 0^28, key=SEED_SALT_{A,B}). */
+void pearl_bind_root_a(const uint8_t hash_a[32], uint32_t m, uint8_t out[32]);
+void pearl_bind_root_b(const uint8_t hash_b[32], uint32_t n, uint8_t out[32]);
+
+/* salted!=0: bind Merkle roots with m/n before the legacy seed chain (cert V3). */
+void pearl_commitment_seeds(const uint8_t job_key[32],
+                            const int8_t* A, const int8_t* Bt,
+                            int m, int n, int k, int salted,
+                            uint8_t b_noise_seed[32], uint8_t a_noise_seed[32]);
+
+void pearl_derive_noise_seeds(const uint8_t job_key[32],
+                              const uint8_t hash_a[32], const uint8_t hash_b[32],
+                              uint32_t m, uint32_t n, int salted,
+                              uint8_t b_noise_seed[32], uint8_t a_noise_seed[32]);
+
+/* Bt may be NULL when signal B^T is all zeros (skips reading matrix bytes). */
+void pearl_b_noise_seed_from_bt(const uint8_t job_key[32],
+                                const int8_t* Bt, int n, int k, int salted,
+                                uint8_t b_noise_seed[32]);
+
+/* Second half of pearl_b_noise_seed_from_bt, from an already computed keyed digest of B^T
+   (e.g. on the GPU). */
+void pearl_b_noise_seed_from_root(const uint8_t job_key[32], const uint8_t hash_b[32], int n,
+                                  int salted, uint8_t b_noise_seed[32]);
+
+/* Zero-B fast path: hash A only, derive a_noise_seed from cached b_noise_seed. */
+void pearl_a_noise_seed_from_a(const uint8_t job_key[32],
+                               const uint8_t b_noise_seed[32],
+                               const int8_t* A, int m, int k, int salted,
+                               uint8_t a_noise_seed[32]);
+
+/* After keyed Merkle hash_a is known (e.g. GPU hash path). */
+void pearl_a_noise_seed_from_hash(const uint8_t b_noise_seed[32],
+                                  const uint8_t hash_a[32],
+                                  uint32_t m, int salted,
+                                  uint8_t a_noise_seed[32]);
+
+void pearl_keyed_matrix_digest(const uint8_t* data, size_t len,
+                               const uint8_t job_key[32], uint8_t out[32]);
+
+int pearl_root_from_chunk_cvs(const uint8_t* chunk_cvs, int num_chunks,
+                              const uint8_t job_key[32], uint8_t out[32]);
+
+/* Returns 0 if chunk-CV Merkle root matches blake3_digest on padded data. */
+int pearl_test_keyed_matrix_root(int m, int n, int k);
+
+int pearl_run_alignment_tests(void);
+
+/* CPU Merkle/chunk test at full padded matrix size (may allocate ~512 MiB per matrix). */
+int pearl_run_alignment_tests_prod(int m, int n, int k);
+
+void pearl_get_random_hash(int index, const uint8_t seed[32], const uint8_t key[32],
+                           int prepend_index, uint8_t out[32]);
+
+void pearl_keyed_digest_int8(const int8_t* mat, size_t raw_len,
+                             const uint8_t job_key[32], uint8_t out[32]);
+
+void pearl_build_perm_pairs_a(const uint8_t noise_seed[32], int k, int rank,
+                              uint32_t* pairs_out);
+void pearl_build_perm_pairs_b(const uint8_t noise_seed[32], int k, int rank,
+                              uint32_t* pairs_out);
+
+void pearl_fuse_noise_row_a(int row, int k, int rank,
+                            const uint8_t a_noise_seed[32],
+                            const uint32_t* pairs, const int8_t* signal_row,
+                            int8_t* noisy_row);
+void pearl_fuse_noise_row_b(int col, int k, int rank,
+                            const uint8_t b_noise_seed[32],
+                            const uint32_t* pairs, const int8_t* signal_row,
+                            int8_t* noisy_row);
+
+/* el_buf[rank], nr_buf[k] — no heap alloc (for fused noise+prepack). */
+void pearl_fuse_noise_row_a_buf(int row, int k, int rank,
+                                const uint8_t a_noise_seed[32],
+                                const uint32_t* pairs, const int8_t* signal_row,
+                                int8_t* noisy_row, int8_t* el_buf, int8_t* nr_buf);
+/* signal_row may be NULL (zero signal, zero-B path). */
+void pearl_fuse_noise_row_b_buf(int col, int k, int rank,
+                                const uint8_t b_noise_seed[32],
+                                const uint32_t* pairs, const int8_t* signal_row,
+                                int8_t* noisy_row, int8_t* el_buf, int8_t* nr_buf);
+
+int pearl_precompute_noise(int m, int n, int k, int rank,
+                           const uint8_t b_noise_seed[32],
+                           const uint8_t a_noise_seed[32],
+                           int32_t* noise_a, int32_t* noise_b);
+
+int pearl_build_noisy_matrices(int m, int n, int k, int rank,
+                               const uint8_t b_noise_seed[32],
+                               const uint8_t a_noise_seed[32],
+                               const int8_t* A, const int8_t* Bt,
+                               int8_t* A_out, int8_t* B_out);
+
+int pearl_build_noisy_a(int m, int k, int rank,
+                        const uint8_t a_noise_seed[32],
+                        const int8_t* A, int8_t* A_out);
+
+/* Bt may be NULL when signal B^T is all zeros. */
+int pearl_build_noisy_b(int n, int k, int rank,
+                        const uint8_t b_noise_seed[32],
+                        const int8_t* Bt, int8_t* B_out);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* CP_NOISE_H */

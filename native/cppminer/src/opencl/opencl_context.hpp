@@ -1,0 +1,128 @@
+#pragma once
+
+#ifndef CL_TARGET_OPENCL_VERSION
+#define CL_TARGET_OPENCL_VERSION 120
+#endif
+#ifdef __APPLE__
+#include <OpenCL/opencl.h>
+#else
+#include <CL/cl.h>
+#endif
+
+#include <cstddef>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+/* Flat enumeration entry (GPU discrete → GPU integrated → CPU). */
+struct OclDeviceInfo {
+    int flat_index = 0;
+    int platform_index = 0;
+    int device_index = 0; /* index within platform+type query order */
+    cl_platform_id platform = nullptr;
+    cl_device_id device = nullptr;
+    cl_device_type type = CL_DEVICE_TYPE_GPU;
+    std::string platform_name;
+    std::string device_name;
+    std::string vendor_name;
+    bool discrete = false; /* GPU with CL_DEVICE_HOST_UNIFIED_MEMORY == false */
+    bool integer_dot_product = false;
+    bool integer_dot_product_hw = false;
+};
+
+struct OpenClContext {
+    cl_platform_id platform = nullptr;
+    cl_device_id device = nullptr;
+    cl_context context = nullptr;
+    cl_command_queue queue = nullptr;
+    cl_program program = nullptr;
+
+    std::string device_name;
+    std::string platform_name;
+    std::string vendor_name;
+    int device_flat_index = -1;
+    bool discrete_gpu = false;
+    bool has_integer_dot_product = false;
+    bool has_integer_dot_product_hw = false;
+    size_t max_work_group_size = 256;
+
+    ~OpenClContext();
+
+    /* Enumerate devices. platform_filter < 0 → all platforms. */
+    static std::vector<OclDeviceInfo> enumerate_devices(int platform_filter = -1);
+
+    /* Print enumerated devices to stdout; returns count. */
+    static int list_devices(int platform_filter = -1);
+
+    /* Select by flat index from enumerate_devices(). Fails if out of range. */
+    bool init(int device_index = 0, int platform_filter = -1);
+    /* Bind an already-enumerated device (e.g. Intel-only list for oneDNN). */
+    bool init(const OclDeviceInfo &pick);
+    bool build_program_from_file(const char *cl_path, const char *build_options = "",
+                                 bool quiet = false);
+    bool build_program_from_source(const char *source, const char *build_options = "",
+                                   bool quiet = false);
+
+    /* Probe clBuildProgram in a child process first (Linux only). Drivers that
+       abort() inside the compiler (e.g. Beignet on __builtin_amdgcn_sdot4) kill
+       only the child; the parent returns false and can fall back to another
+       build. Windows/Apple skip the probe (no fork / OpenCL not fork-safe).
+       Does not modify this->program. */
+    bool probe_build(const char *source, const char *build_options = "");
+
+    /* probe_build() then build_program_from_source/file if the probe survives. */
+    bool safe_build_program_from_source(const char *source, const char *build_options = "",
+                                        bool quiet = false);
+    bool safe_build_program_from_file(const char *cl_path, const char *build_options = "",
+                                      bool quiet = false);
+
+    cl_kernel create_kernel(const char *name) const;
+
+    /* Transfers that are complete on return. On the Arc A770 (Windows) clEnqueueWriteBuffer /
+       clEnqueueReadBuffer occasionally wait ~70 s on a GPU fence inside the driver
+       (D3DKMTWaitForSynchronizationObjectFromCpu; CPU and GPU idle, then they return normally). On
+       Intel discrete GPUs transfers of <= 64 KB into / out of read-write buffers therefore use no
+       transfer call: the bytes pass through a host USM block (cl_intel_unified_shared_memory) and a
+       one-line copy kernel, completed with clFinish. CP_OCL_XFER_STAGE=0 restores the transfer calls,
+       =1 forces the kernel path on any USM device; CP_OCL_XFER_WATCH=<ms> logs slow transfers. */
+    bool write_buffer(cl_mem buf, const void *host, size_t bytes, size_t offset = 0) const;
+    bool read_buffer(cl_mem buf, void *host, size_t bytes, size_t offset = 0) const;
+    /* Device-to-device copy, enqueued (not waited for) on `queue` like clEnqueueCopyBuffer. With the
+       small-transfer kernel path active it runs as a copy kernel on the compute engine, so no copy
+       engine wait is involved; otherwise (or above 16 MB) it is clEnqueueCopyBuffer. */
+    bool copy_buffer(cl_mem src, size_t src_offset, cl_mem dst, size_t dst_offset, size_t bytes) const;
+    cl_mem alloc_buffer(size_t bytes, cl_mem_flags flags) const;
+
+    static std::string error_string(cl_int err);
+
+    /* "dddd:bb:dd.f" of a device (cl_khr_pci_bus_info, AMD topology or NVIDIA ids), "" if the
+       driver reports none. */
+    static std::string pci_bus_id(cl_device_id dev);
+
+    /* Command queue with the cl_khr_throttle_hints level set by cp_ocl_set_queue_throttle (LOW:
+       Intel's runtime then sleeps in clFinish / clWaitForEvents / blocking reads instead of spinning
+       a CPU core) when the device advertises the extension; otherwise, or if the driver rejects the
+       hint, a plain queue. */
+    static cl_command_queue create_queue(cl_context context, cl_device_id device,
+                                         cl_command_queue_properties props, cl_int *err);
+
+private:
+    static void dump_program_binary_(cl_program prog);
+    bool stage_small_xfer_(cl_mem buf, size_t bytes, bool device_write) const;
+    bool xfer_kernels_on_() const;
+    bool init_xfer_kernels_() const;
+    void release_xfer_() const;
+    mutable int xfer_stage_on_ = -1;        /* -1 = not decided yet */
+    mutable void *xfer_host_ = nullptr;     /* host USM block (64 KB) */
+    mutable cl_program xfer_prog_ = nullptr;
+    mutable cl_kernel xfer_up_ = nullptr;   /* host USM -> cl_mem */
+    mutable cl_kernel xfer_down_ = nullptr; /* cl_mem -> host USM */
+    mutable cl_kernel xfer_dd_ = nullptr;   /* cl_mem -> cl_mem */
+    mutable void *usm_free_fn_ = nullptr;
+    mutable void *usm_arg_fn_ = nullptr;
+    std::shared_ptr<std::mutex> xfer_mu_ = std::make_shared<std::mutex>();
+};
+
+std::string read_text_file(const char *path);
+std::string exe_directory(const char *argv0);

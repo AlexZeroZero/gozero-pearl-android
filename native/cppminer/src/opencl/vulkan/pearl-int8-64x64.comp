@@ -1,0 +1,111 @@
+#version 450
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions=["SPV_KHR_integer_dot_product"], capabilities=[6018,6019], id=4450)
+int packedDot(int a,int b,spirv_literal int format);
+layout(set=0,binding=0,std430) readonly buffer A { uint a[]; };
+layout(set=0,binding=1,std430) readonly buffer B { uint b[]; };
+layout(set=0,binding=2,std430) buffer Control { uint ctrl[]; };
+layout(push_constant) uniform Params {uint m;uint n;uint base;} p;
+uint rotr(uint v,int n){return (v>>n)|(v<<(32-n));}
+void g(inout uint v[16],int a,int b,int c,int d,uint x,uint y){
+v[a]+=v[b]+x;v[d]=rotr(v[d]^v[a],16);v[c]+=v[d];v[b]=rotr(v[b]^v[c],12);
+v[a]+=v[b]+y;v[d]=rotr(v[d]^v[a],8);v[c]+=v[d];v[b]=rotr(v[b]^v[c],7);}
+bool jackpot(uint msg[16]){
+ uint v[16]=uint[16](ctrl[0],ctrl[1],ctrl[2],ctrl[3],ctrl[4],ctrl[5],ctrl[6],ctrl[7],0x6A09E667u,0xBB67AE85u,0x3C6EF372u,0xA54FF53Au,0u,0u,64u,0x1Bu);
+ const int perm[16]=int[16](2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8);
+ for(int r=0;r<7;r++){
+  g(v,0,4,8,12,msg[0],msg[1]);g(v,1,5,9,13,msg[2],msg[3]);g(v,2,6,10,14,msg[4],msg[5]);g(v,3,7,11,15,msg[6],msg[7]);
+  g(v,0,5,10,15,msg[8],msg[9]);g(v,1,6,11,12,msg[10],msg[11]);g(v,2,7,8,13,msg[12],msg[13]);g(v,3,4,9,14,msg[14],msg[15]);
+  if(r<6){uint t[16];for(int i=0;i<16;i++)t[i]=msg[perm[i]];for(int i=0;i<16;i++)msg[i]=t[i];}
+ }
+ for(int i=7;i>=0;i--){uint h=v[i]^v[i+8];if(h<ctrl[8+i])return true;if(h>ctrl[8+i])return false;}
+ return true;
+}
+layout(local_size_x=128) in;
+void main(){
+uint lid=gl_LocalInvocationID.x;uint tr=lid%16;uint tc=lid/16;
+uint im=(p.base+gl_WorkGroupID.x)%(p.m/64);uint jm=(p.base+gl_WorkGroupID.x)/(p.m/64);
+uint msg[16];for(int i=0;i<16;i++)msg[i]=0;
+int c00=0;
+int c01=0;
+int c02=0;
+int c03=0;
+int c04=0;
+int c05=0;
+int c06=0;
+int c07=0;
+int c10=0;
+int c11=0;
+int c12=0;
+int c13=0;
+int c14=0;
+int c15=0;
+int c16=0;
+int c17=0;
+int c20=0;
+int c21=0;
+int c22=0;
+int c23=0;
+int c24=0;
+int c25=0;
+int c26=0;
+int c27=0;
+int c30=0;
+int c31=0;
+int c32=0;
+int c33=0;
+int c34=0;
+int c35=0;
+int c36=0;
+int c37=0;
+for(uint ms=0;ms<32;ms++){for(uint kg=0;kg<32;kg++){
+int av0=int(a[im*65536+ms*2048+kg*64+tr*4+0]);
+int av1=int(a[im*65536+ms*2048+kg*64+tr*4+1]);
+int av2=int(a[im*65536+ms*2048+kg*64+tr*4+2]);
+int av3=int(a[im*65536+ms*2048+kg*64+tr*4+3]);
+int bv0=int(b[jm*65536+ms*2048+kg*64+tc*8+0]);
+int bv1=int(b[jm*65536+ms*2048+kg*64+tc*8+1]);
+int bv2=int(b[jm*65536+ms*2048+kg*64+tc*8+2]);
+int bv3=int(b[jm*65536+ms*2048+kg*64+tc*8+3]);
+int bv4=int(b[jm*65536+ms*2048+kg*64+tc*8+4]);
+int bv5=int(b[jm*65536+ms*2048+kg*64+tc*8+5]);
+int bv6=int(b[jm*65536+ms*2048+kg*64+tc*8+6]);
+int bv7=int(b[jm*65536+ms*2048+kg*64+tc*8+7]);
+c00+=packedDot(av0,bv0,0);
+c01+=packedDot(av0,bv1,0);
+c02+=packedDot(av0,bv2,0);
+c03+=packedDot(av0,bv3,0);
+c04+=packedDot(av0,bv4,0);
+c05+=packedDot(av0,bv5,0);
+c06+=packedDot(av0,bv6,0);
+c07+=packedDot(av0,bv7,0);
+c10+=packedDot(av1,bv0,0);
+c11+=packedDot(av1,bv1,0);
+c12+=packedDot(av1,bv2,0);
+c13+=packedDot(av1,bv3,0);
+c14+=packedDot(av1,bv4,0);
+c15+=packedDot(av1,bv5,0);
+c16+=packedDot(av1,bv6,0);
+c17+=packedDot(av1,bv7,0);
+c20+=packedDot(av2,bv0,0);
+c21+=packedDot(av2,bv1,0);
+c22+=packedDot(av2,bv2,0);
+c23+=packedDot(av2,bv3,0);
+c24+=packedDot(av2,bv4,0);
+c25+=packedDot(av2,bv5,0);
+c26+=packedDot(av2,bv6,0);
+c27+=packedDot(av2,bv7,0);
+c30+=packedDot(av3,bv0,0);
+c31+=packedDot(av3,bv1,0);
+c32+=packedDot(av3,bv2,0);
+c33+=packedDot(av3,bv3,0);
+c34+=packedDot(av3,bv4,0);
+c35+=packedDot(av3,bv5,0);
+c36+=packedDot(av3,bv6,0);
+c37+=packedDot(av3,bv7,0);
+}
+uint x=uint(c00^c01^c02^c03^c04^c05^c06^c07^c10^c11^c12^c13^c14^c15^c16^c17^c20^c21^c22^c23^c24^c25^c26^c27^c30^c31^c32^c33^c34^c35^c36^c37);
+msg[ms%16]^=ms<16?((x<<13)|(x>>19)):x;
+}
+if(jackpot(msg)&&atomicCompSwap(ctrl[16],0,1)==0){ctrl[17]=im*64+tr*4;ctrl[18]=jm*64+tc*8;}
+}

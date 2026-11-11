@@ -1,0 +1,15 @@
+.gradle/
+**/build/
+**/target/
+local.properties
+*.log
+device-tests/
+releases/
+*.p12
+*.jks
+*.dpapi.xml
+.publish/
+__pycache__/
+*.pyc
+.env
+.env.*

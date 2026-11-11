@@ -1,0 +1,110 @@
+# OpenCL GEMM issue shape
+
+Scalar / packed paths in `src/opencl/kernels/case33_gemm_xor.cl`. Select with `--ocl-issue`.
+
+The OpenCL register tile can be `4x4`, `4x8`, `8x8`, or `8x16`. Pearl requires
+at least 32 cells per hash tile, so the `4x4` path assigns one work-item to a
+semantic `4x8` hash tile. It processes the two four-column halves sequentially
+with a reused 4x4 accumulator and folds both halves directly into one private
+message before BLAKE3. No inter-work-item exchange is required. The `4x4`
+path stores four B columns per register tile; wider paths store eight or sixteen.
+
+Packed B has no column-group dimension. Within each K-group, every `tc` stores
+its `NR` rank-4 column values consecutively:
+
+```text
+[macro_column][K_block][K_group][tc][column][rank4]
+```
+
+All register tiles use column-major work-item order. Within each row-tile run,
+adjacent work-items share a column tile and walk consecutive row tiles, making
+each B load uniform across those work-items. Packing and the existing `vload4`
+loads are unchanged.
+
+| Mode | Flag | Inner loop |
+|------|------|------------|
+| **auto** (default) | `--ocl-issue auto` | Same nest as accelerated/scalar path chosen by `--ocl-dot` |
+| **broadcast** | `--ocl-issue broadcast` | Force cpm: `cpm += aval * bscalar` (`CASE32_NO_DPI`) |
+| **packed** | `--ocl-issue packed` | Per-C `dot4` / DP4A into `acc[j,i]` (still uses `--ocl-dot` cascade) |
+
+`broadcast` / scalar fallback pass `-DCASE32_NO_DPI=1` so Intel cannot auto-enable KHR DPI and silently switch to packed dots.
+
+### Dot backend (`--ocl-dot`)
+
+Separate from issue shape. `build_kernel_` builds an ordered candidate list and takes the first that compiles.
+
+| Mode | Flag | Candidates |
+|------|------|------------|
+| **auto** (default) | `--ocl-dot auto` | AMD: sudot4 â†?sdot4 â†?KHR (if advertised) â†?scalar; others: KHR (if advertised) â†?scalar |
+| **sudot** | `--ocl-dot sudot` | sudot4 â†?scalar |
+| **sdot4** | `--ocl-dot sdot4` | sdot4 â†?scalar |
+| **khr** | `--ocl-dot khr` | KHR (if advertised) â†?scalar |
+| **force-khr** | `--ocl-dot force-khr` | forced KHR â†?scalar |
+| **asm** | `--ocl-dot asm` | experimental `v_dot4c` â†?scalar |
+| **off** | `--ocl-dot off` | scalar only |
+
+Asm is opt-in only; it is not part of `auto`.
+
+### cpm type (`--ocl-cpm-type`)
+
+| Type | Flag | Accumulation |
+|------|------|--------------|
+| **auto** (default) | `--ocl-cpm-type auto` | **mad24** on AMD GCN gfx6-8 with `--ocl-issue auto`, otherwise **float** |
+| **float** | `--ocl-cpm-type float` | `float4 mad` into a cpm panel, flushed to int32 each KR |
+| **int** | `--ocl-cpm-type int` | int8 to int32 lanes, `int4` mul+add straight into the int32 tile (no panel) |
+| **mad24** | `--ocl-cpm-type mad24` | scalar `mad24` straight into the int32 tile (native only on AMD) |
+
+Only applies when the scalar nest is built (no int8 dot backend, or `--ocl-issue broadcast`);
+otherwise the miner warns that the flag is ignored. `int` and `mad24` update the int32 tile on
+every MAC, so the kernel fully unrolls every loop over it to keep it in registers. Float keeps
+its panel because float is only exact below 2^24, so it must be flushed every KR.
+`CP_OCL_GCN=1/0` overrides the GCN detection used by `auto`.
+
+### LDS staging (`--ocl-lds`)
+
+Optional `__local` A/B panel staging with work-group barriers (`CASE32_USE_LDS`). Default **off**.
+
+On most GPUs this **regressed** scan throughput: barrier + globalâ†’local copy cost outweighed reuse. Prefer leaving it off unless a device shows a clear win in an A/B test.
+
+### Register double buffer (`--ocl-double-buff`)
+
+The coalesced, non-LDS k-group loop can prefetch the next k-group's A/B packs into a second register set while the current one feeds the dot4s (`CASE32_PIPELINE`). Default **off**: it raises VGPR use (Radeon 780M: 206 instead of 180, 4 instead of 5 waves/SIMD) and may spill on devices with fewer registers. Measured gains: about +2.5% on the 780M (gfx1103) and 5.1 -> 5.4 TMAC/s on a Radeon 5500M (gfx1012). Ignored with `--ocl-lds on` or an odd `KGROUPS`.
+
+## packed
+
+```text
+for each of NR columns:
+  for each of MR rows:
+    acc[j,i] += dot4(A[i][k:k+4], B[j][k:k+4])
+```
+
+## broadcast / cpm
+
+```text
+cvec += avec * bscalar    // mad(float4, float, float4)
+```
+
+| Parameter | Value | Role |
+|-----------|------:|------|
+| `VWM` | 4 | vector along M (`aval`) |
+| `VWN` | 4 | four N columns; each B lane is a scalar broadcast |
+| K-step | 4 | packed `char4` lanes |
+
+## Compare
+
+```bash
+# default auto (on Intel without DPI â†?cpm float)
+./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --m 8 --n 8 --batch-size 32
+
+# force cpm (same nest as beignet-fix scalar)
+./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --m 8 --n 8 --batch-size 32 \
+  --ocl-issue broadcast
+
+# force packed dots
+./cppminer --backend opencl --mock --cpu-gen --ocl-tile 4x8 --m 8 --n 8 --batch-size 32 \
+  --ocl-issue packed
+```
+
+Wait for `[ocl] attempt timing: â€?GMAC/s`. Look for `clblast cpm float` in the backend line and `private=â€?B/WI` from the kernel mem print.
+
+Broadcast+float issue may improve performance on GPUs that are weak in int but strong in float. UHD 630 (no DPI) is fastest with broadcast+float (~115 GH/s vs ~100 GH/s packed scalar). AMD/NVIDIA with hardware DPI typically see a large gain from `dot_acc_sat` / packed issue.

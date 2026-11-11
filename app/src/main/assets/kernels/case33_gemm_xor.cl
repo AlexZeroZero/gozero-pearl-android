@@ -1,0 +1,873 @@
+// Case 3.3: Case 3.2 int8 GEMM + milestoned MR×NR tile XOR + optional fused device jackpot.
+//
+// fuse_jackpot=1 (mining): milestone XORs fold online into private msg[16]; BLAKE3 + target
+// compare on-device. Host readback is only found_flag (+ t_rows/t_cols on hit).
+// fuse_jackpot=0: legacy tile_xor writeback for correctness benchmarks.
+//
+// Private memory (fuse_jackpot mining path; source arrays + compiler stack):
+//   acc[NR×MR]  4×4: 64 B   8×8: 256 B   8×16: 512 B
+//   msg[16]          64 B         64 B         64 B
+//   a_pack[MR]       16 B         32 B         32 B
+//   digest[8]        32 B         32 B         32 B
+//   b3_compress64     ~192 B       ~192 B  (inlined v/m/t; Beignet may reserve for whole kernel)
+// Measured CL_KERNEL_PRIVATE_MEM_SIZE on Beignet (Haswell GT1, scalar):
+//   8×8: 128 B/WI with CLBlast cpm issue (was 384 with per-element dot4; 1152 with ms_xor)
+//   8×16: 1152 B/WI (acc spill dominates)
+// Issue shape (matches beignet-fix / case36):
+//   !CASE32_PACKED_DOT (scalar / --ocl-issue broadcast): CLBlast GEMMK=0 cpm += aval * bscalar
+//   CASE32_PACKED_DOT (--ocl-issue packed or DPI): per-C case32_dot4
+//   --ocl-cpm-type float (default): float4 mad into a cpm panel, flushed to int32 every KR.
+//   --ocl-cpm-type int (CASE32_CPM_INT): int4 mul+add straight into acc (no panel).
+//   --ocl-cpm-type mad24 (CASE32_GCN_MAD24): scalar mad24 straight into acc. CASE32_NO_DPI blocks
+//   auto-enabling KHR DPI when the host requests the scalar cpm nest.
+
+#ifndef MR
+#define MR 8
+#endif
+#ifndef NR
+#define NR 16
+#endif
+#ifndef HASH_NR
+#define HASH_NR NR
+#endif
+#define HASH_REG_TILES_N (HASH_NR / NR)
+#if (HASH_NR % NR) != 0 || HASH_REG_TILES_N < 1 || HASH_REG_TILES_N > 2
+#error HASH_NR must contain one or two register tiles
+#endif
+#ifndef KR
+#define KR 128
+#endif
+#ifndef MACRO_M
+#define MACRO_M 128
+#endif
+#ifndef MACRO_N
+#define MACRO_N 128
+#endif
+#ifndef PANEL_A
+#define PANEL_A (KR * MR)
+#endif
+#ifndef PANEL_B
+#define PANEL_B (KR * NR)
+#endif
+#ifndef RANK
+#define RANK 4
+#endif
+#ifndef VWM
+#define VWM 4
+#endif
+#ifndef VWN
+#define VWN 4
+#endif
+#define CPM_COLVEC (MR / VWM)
+#define CPM_NVEC (NR * CPM_COLVEC)
+#if (MR % VWM) != 0 || (NR % VWN) != 0
+#error CLBlast-style cpm tile requires MR%VWM==0 and NR%VWN==0
+#endif
+#ifndef KGROUPS
+#define KGROUPS (KR / RANK)
+#endif
+#ifndef KG_BYTES_A
+#define KG_BYTES_A (MR * RANK)
+#endif
+#ifndef MICRO_M
+#define MICRO_M (MACRO_M / MR)
+#endif
+#ifndef MICRO_N
+#define MICRO_N (MACRO_N / NR)
+#endif
+#define HASH_MICRO_N (MACRO_N / HASH_NR)
+#ifndef KG_SLICE_B
+#define KG_SLICE_B (NR * RANK)
+#endif
+#ifndef MACRO_KG_STRIP_A
+#define MACRO_KG_STRIP_A (MICRO_M * KG_BYTES_A)
+#endif
+#ifndef MACRO_KG_STRIP_B
+#define MACRO_KG_STRIP_B (MICRO_N * KG_SLICE_B)
+#endif
+#ifndef MACRO_KB_BLOCK_A
+#define MACRO_KB_BLOCK_A (KGROUPS * MACRO_KG_STRIP_A)
+#endif
+#ifndef MACRO_KB_BLOCK_B
+#define MACRO_KB_BLOCK_B (KGROUPS * MACRO_KG_STRIP_B)
+#endif
+#ifndef CASE32_USE_LDS
+#define CASE32_USE_LDS 0
+#endif
+/* Register double-buffered k-group loop (coalesced, non-LDS path only; needs an even
+   KGROUPS and the flat kb/kg stride, i.e. MACRO_KB_BLOCK_A == KGROUPS*MACRO_KG_STRIP_A).
+   Off by default (--ocl-double-buff on sets -DCASE32_PIPELINE=1): the second register set
+   raises VGPR pressure and can spill or lose occupancy on some devices. */
+#ifndef CASE32_PIPELINE
+#define CASE32_PIPELINE 0
+#endif
+#if CASE32_PIPELINE && (!defined(CASE32_COALESCE) || CASE32_USE_LDS || (KGROUPS % 2) != 0)
+#undef CASE32_PIPELINE
+#define CASE32_PIPELINE 0
+#endif
+/* Work-group -> macro-block super-tile shape (see kernel body). 1x1 = linear map. */
+#ifndef SWZ_IM
+#define SWZ_IM 8
+#endif
+#ifndef SWZ_JM
+#define SWZ_JM 4
+#endif
+#ifndef CASE32_CPM_INT
+#define CASE32_CPM_INT 0
+#endif
+#if CASE32_CPM_INT
+typedef int cpm_lane;
+typedef int4 cpm_vec;
+#define CASE32_CPM_ZERO ((int4)(0))
+#define CASE32_CPM_SPLAT(b) ((int4)(b))
+#define CASE32_CPM_MAD(aval, bsc, c) ((aval) * CASE32_CPM_SPLAT(bsc) + (c))
+#else
+typedef float cpm_lane;
+typedef float4 cpm_vec;
+#define CASE32_CPM_ZERO ((float4)(0.0f))
+#define CASE32_CPM_SPLAT(b) ((float4)(b))
+#define CASE32_CPM_MAD(aval, bsc, c) mad((aval), CASE32_CPM_SPLAT(bsc), (c))
+#endif
+/* How many coalesce kg-strips to stage in LDS at once (Case 3.4; keep SLM modest). */
+#ifndef KG_LDS_CHUNK
+#define KG_LDS_CHUNK 8
+#endif
+
+#define PP_JACKPOT_WORDS 16
+#define PP_LROT 13
+#ifndef R_RANK
+#define R_RANK 128
+#endif
+#ifndef PP_MAX_MILESTONES
+#define PP_MAX_MILESTONES 32
+#endif
+/* KR == R_RANK: one packed K-panel is one jackpot milestone. */
+
+#ifdef cl_khr_integer_dot_product
+#ifndef CASE32_NO_DPI
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+#define CASE32_USE_DOT 1
+#endif
+#endif
+#if defined(CASE32_FORCE_DPI)
+#ifndef CASE32_NO_DPI
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+#define CASE32_USE_DOT 1
+#endif
+#endif
+
+inline uint pp_rotl32(uint x, int s) { return (x << s) | (x >> (32 - s)); }
+
+inline uint b3_rotr32(uint x, int n) { return (x >> n) | (x << (32 - n)); }
+
+inline void b3_g(uint *v, int a, int b, int c, int d, uint x, uint y) {
+    v[a] += v[b] + x;
+    v[d] = b3_rotr32(v[d] ^ v[a], 16);
+    v[c] += v[d];
+    v[b] = b3_rotr32(v[b] ^ v[c], 12);
+    v[a] += v[b] + y;
+    v[d] = b3_rotr32(v[d] ^ v[a], 8);
+    v[c] += v[d];
+    v[b] = b3_rotr32(v[b] ^ v[c], 7);
+}
+
+inline void b3_compress64(__global const uint *key8, const uint *msg16, uint *out8) {
+    const uint kIV[8] = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+                         0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u};
+    uint v[16] = {key8[0], key8[1], key8[2], key8[3], key8[4], key8[5], key8[6], key8[7],
+                  kIV[0],  kIV[1],  kIV[2],  kIV[3],  0u,      0u,      64u,     0x1Bu};
+    uint m[16];
+    for (int i = 0; i < 16; ++i) {
+        m[i] = msg16[i];
+    }
+    const uchar kPerm[16] = {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8};
+    for (int round = 0; round < 7; ++round) {
+        b3_g(v, 0, 4, 8, 12, m[0], m[1]);
+        b3_g(v, 1, 5, 9, 13, m[2], m[3]);
+        b3_g(v, 2, 6, 10, 14, m[4], m[5]);
+        b3_g(v, 3, 7, 11, 15, m[6], m[7]);
+        b3_g(v, 0, 5, 10, 15, m[8], m[9]);
+        b3_g(v, 1, 6, 11, 12, m[10], m[11]);
+        b3_g(v, 2, 7, 8, 13, m[12], m[13]);
+        b3_g(v, 3, 4, 9, 14, m[14], m[15]);
+        if (round < 6) {
+            uint t[16];
+            for (int i = 0; i < 16; ++i) {
+                t[i] = m[kPerm[i]];
+            }
+            for (int i = 0; i < 16; ++i) {
+                m[i] = t[i];
+            }
+        }
+    }
+    for (int i = 0; i < 8; ++i) {
+        out8[i] = v[i] ^ v[i + 8];
+    }
+}
+
+inline bool digest_beats_target(const uint digest[8], __global const uint *bound) {
+    for (int w = 7; w >= 0; --w) {
+        if (digest[w] < bound[w]) {
+            return true;
+        }
+        if (digest[w] > bound[w]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#if defined(CASE32_USE_ASM_DOT) || defined(CASE32_USE_BUILTIN_SDOT4) || \
+        defined(CASE32_USE_BUILTIN_SUDOT4) || \
+        defined(CASE32_USE_DOT) || defined(CASE32_INT_DOT) || \
+        defined(CASE32_FORCE_PACKED) || defined(CASE32_GCN_MAD24)
+#define CASE32_PACKED_DOT 1
+#else
+#define CASE32_PACKED_DOT 0
+#endif
+/* Separate cpm panel (zeroed and flushed into acc every KR): float broadcast only. The int
+   broadcast nest accumulates straight into acc (int32 wraps identically), saving MR*NR
+   live registers and the per-KR zero/flush. */
+#if !CASE32_PACKED_DOT && !CASE32_CPM_INT
+#define CASE32_CPM_PANEL 1
+#else
+#define CASE32_CPM_PANEL 0
+#endif
+
+inline int case32_dot4(int acc, int a_pack, int b_pack) {
+#if defined(CASE32_USE_ASM_DOT)
+    __asm volatile("v_dot4c_i32_i8 %0, %1, %2" : "+v"(acc) : "v"(a_pack), "v"(b_pack));
+    return acc;
+#elif defined(CASE32_USE_BUILTIN_SUDOT4)
+    /* RDNA3 (gfx11) spells the int8 dot product V_DOT4_I32_IU8, reached via
+     * sudot4 with both operands marked signed. The older sdot4 and v_dot4c
+     * forms need dot1-insts, which gfx11 does not have, so on a Radeon 780M
+     * the accelerated path fell through to the scalar 4x MAC nest. */
+    return __builtin_amdgcn_sudot4(true, a_pack, true, b_pack, acc, false);
+#elif defined(CASE32_USE_BUILTIN_SDOT4)
+    return __builtin_amdgcn_sdot4(a_pack, b_pack, acc, false);
+#elif defined(CASE32_USE_DOT)
+    return dot_acc_sat(as_char4(a_pack), as_char4(b_pack), acc);
+#else
+    char4 a = as_char4(a_pack);
+    char4 b = as_char4(b_pack);
+    acc += (int)a.s0 * (int)b.s0;
+    acc += (int)a.s1 * (int)b.s1;
+    acc += (int)a.s2 * (int)b.s2;
+    acc += (int)a.s3 * (int)b.s3;
+    return acc;
+#endif
+}
+
+#if !CASE32_PACKED_DOT
+/* CLBlast GEMMK=0 issue: cpm[n][m] += apm[m] * bpm[n]
+   VWM along M, VWN along N, B broadcast as a scalar. Packed K=4 is the
+   unrolled KWI. Default float panel is flushed to int32 each KR (exact:
+   |sum|<2^21). CASE32_CPM_INT uses int4 acc (int8 lanes; mul is int32). */
+
+inline cpm_lane case32_char_lane(char4 c, int k) {
+    if (k == 0) {
+        return (cpm_lane)c.s0;
+    }
+    if (k == 1) {
+        return (cpm_lane)c.s1;
+    }
+    if (k == 2) {
+        return (cpm_lane)c.s2;
+    }
+    return (cpm_lane)c.s3;
+}
+
+inline cpm_vec case32_apm(__private const char4 *ar, int row0, int k) {
+    return (cpm_vec)(case32_char_lane(ar[row0], k), case32_char_lane(ar[row0 + 1], k),
+                     case32_char_lane(ar[row0 + 2], k), case32_char_lane(ar[row0 + 3], k));
+}
+
+inline void case32_cpm_zero(__private cpm_vec *cpm) {
+    #pragma unroll
+    for (int i = 0; i < CPM_NVEC; ++i) {
+        cpm[i] = CASE32_CPM_ZERO;
+    }
+}
+
+inline void case32_cpm_kgroup(__private cpm_vec *cpm, __private const int *a_pack,
+                              __private const int *b_pack) {
+    char4 ar[MR];
+    char4 br[NR];
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        ar[i] = as_char4(a_pack[i]);
+    }
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        br[j] = as_char4(b_pack[j]);
+    }
+    #pragma unroll
+    for (int k = 0; k < RANK; ++k) {
+        #pragma unroll
+        for (int mi = 0; mi < CPM_COLVEC; ++mi) {
+            const cpm_vec aval = case32_apm(ar, mi * VWM, k);
+            #pragma unroll
+            for (int ni = 0; ni < NR / VWN; ++ni) {
+                const int j0 = ni * VWN;
+                cpm[(j0 + 0) * CPM_COLVEC + mi] = CASE32_CPM_MAD(
+                        aval, case32_char_lane(br[j0 + 0], k),
+                        cpm[(j0 + 0) * CPM_COLVEC + mi]);
+                cpm[(j0 + 1) * CPM_COLVEC + mi] = CASE32_CPM_MAD(
+                        aval, case32_char_lane(br[j0 + 1], k),
+                        cpm[(j0 + 1) * CPM_COLVEC + mi]);
+                cpm[(j0 + 2) * CPM_COLVEC + mi] = CASE32_CPM_MAD(
+                        aval, case32_char_lane(br[j0 + 2], k),
+                        cpm[(j0 + 2) * CPM_COLVEC + mi]);
+                cpm[(j0 + 3) * CPM_COLVEC + mi] = CASE32_CPM_MAD(
+                        aval, case32_char_lane(br[j0 + 3], k),
+                        cpm[(j0 + 3) * CPM_COLVEC + mi]);
+            }
+        }
+    }
+}
+
+inline void case32_cpm_flush(__private int *acc, __private const cpm_vec *cpm) {
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        #pragma unroll
+        for (int mi = 0; mi < CPM_COLVEC; ++mi) {
+            const int4 t = convert_int4(cpm[j * CPM_COLVEC + mi]);
+            const int base = j * MR + mi * VWM;
+            acc[base + 0] += t.s0;
+            acc[base + 1] += t.s1;
+            acc[base + 2] += t.s2;
+            acc[base + 3] += t.s3;
+        }
+    }
+}
+
+#if CASE32_CPM_INT
+/* Same broadcast issue as case32_cpm_kgroup, accumulated straight into acc: lane l of
+   cpm[j * CPM_COLVEC + mi] is acc[j * MR + mi * VWM + l]. Keep the int4 CASE32_CPM_MAD form:
+   the AMD compiler turns that chain into v_dot4 on gfx1012 (5500M: 5.1 TMAC/s with
+   --ocl-dot off), while the same math as scalar acc[] += a * b stays at ~1.0 TMAC/s. */
+static inline void case32_cpm_kgroup_direct(__private int *acc, __private const int *a_pack,
+                                            __private const int *b_pack) {
+    char4 ar[MR];
+    char4 br[NR];
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        ar[i] = as_char4(a_pack[i]);
+    }
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        br[j] = as_char4(b_pack[j]);
+    }
+    #pragma unroll
+    for (int k = 0; k < RANK; ++k) {
+        #pragma unroll
+        for (int mi = 0; mi < CPM_COLVEC; ++mi) {
+            const cpm_vec aval = case32_apm(ar, mi * VWM, k);
+            #pragma unroll
+            for (int j = 0; j < NR; ++j) {
+                const int base = j * MR + mi * VWM;
+                int4 c = (int4)(acc[base + 0], acc[base + 1], acc[base + 2], acc[base + 3]);
+                c = CASE32_CPM_MAD(aval, case32_char_lane(br[j], k), c);
+                acc[base + 0] = c.s0;
+                acc[base + 1] = c.s1;
+                acc[base + 2] = c.s2;
+                acc[base + 3] = c.s3;
+            }
+        }
+    }
+}
+
+/* acc is updated on every MAC here, so every loop over acc must unroll or a rolled
+   dynamic index sends the whole array to scratch (see the GCN note below). */
+#define CASE32_ACC_UNROLL _Pragma("unroll")
+#endif
+#endif
+
+#if defined(CASE32_GCN_MAD24)
+/* AMD GPUs without int8 dot instructions (GCN gfx8 Polaris/Fiji/Tonga, gfx900 Vega 10,
+   gfx1010 RDNA1). The best they do is one v_mad_i32_i24 per MAC, so accumulate straight
+   into the int32 tile (no float cpm panel: cpm + acc = 2x MR*NR registers spilled to
+   scratch on gfx803 at 8x16) and unpack the int8 operands one k at a time, MR + NR
+   v_bfe_i32 per MR*NR mads (~19% at 8x16), keeping ~MR*NR + 3*(MR+NR) VGPRs live. */
+/* Byte k of a packed int8 quad, sign-extended. With a run-time k (rolled loop) clang's
+   AMDGPU backend emits v_lshrrev + v_bfe_i32 for the portable form; the builtin is a
+   single v_bfe_i32 with a register offset. */
+#if defined(__AMDGCN__) && defined(__has_builtin)
+#if __has_builtin(__builtin_amdgcn_sbfe)
+#define CASE32_GCN_BYTE(x, k) __builtin_amdgcn_sbfe((x), (uint)(8 * (k)), 8u)
+#endif
+#endif
+#ifndef CASE32_GCN_BYTE
+#define CASE32_GCN_BYTE(x, k) ((int)(char)((x) >> (8 * (k))))
+#endif
+/* One MAC. mad24() is the 24-bit multiply-add, native v_mad_i32_i24 in AMD drivers.
+   The plain form relies on the compiler proving the operands fit in 24 bits: upstream
+   clang does, but the AMD Windows driver for Polaris emitted the quarter-rate 32-bit
+   multiply (313 GMAC/s on an RX 580 vs 1.49 TMAC/s for the float cpm nest).
+   -DCASE32_GCN_PLAIN_MUL selects the plain form (offline clang -nogpulib analysis,
+   where mad24 is an unresolved library call). */
+#if defined(CASE32_GCN_PLAIN_MUL)
+#define CASE32_GCN_MAC(a, b, c) ((c) + (a) * (b))
+#else
+#define CASE32_GCN_MAC(a, b, c) mad24((a), (b), (c))
+#endif
+
+/* The GCN nest updates acc[] on every MAC, so acc[] must live in registers. The AMD
+   Windows driver for Polaris leaves the 128-iteration zero/XOR loops over acc[] rolled;
+   their dynamic index sends the whole array to scratch (CL_KERNEL_PRIVATE_MEM_SIZE
+   576 B = acc 512 + msg 64) and every MAC becomes a scratch read-modify-write: 313
+   GMAC/s on an RX 580 vs 1.49 TMAC/s for the float cpm nest, which only flushes into
+   acc[] once per KR. Unroll those loops on this path. */
+#define CASE32_ACC_UNROLL _Pragma("unroll")
+
+/* static: a plain C99 inline has no external definition; when the AMD Windows driver
+   declines to inline it (mad24 library call), linking fails with "undefined hidden
+   symbol: case32_gcn_kgroup". */
+static inline void case32_gcn_kgroup(__private int *acc, __private const int *a_pack,
+                                     __private const int *b_pack) {
+/* k-loop unroll. RX 580 (AMD Windows driver, 8k, with the register double-buffered
+   k-group loop): rolled 2.17 vs unrolled 2.10 TMAC/s, both with acc[] in registers
+   (full pool size: 1.9 vs 1.38 for the float cpm nest).
+   Upstream clang without __builtin_amdgcn_sbfe prefers 4 (780M forced: 2.32 vs 1.39);
+   CP_OCL_GCN_KUNROLL overrides. */
+#ifndef CASE32_GCN_KUNROLL
+#define CASE32_GCN_KUNROLL 1
+#endif
+    #pragma unroll CASE32_GCN_KUNROLL
+    for (int k = 0; k < RANK; ++k) {
+        int av[MR];
+        int bv[NR];
+        #pragma unroll
+        for (int i = 0; i < MR; ++i) {
+            av[i] = CASE32_GCN_BYTE(a_pack[i], k);
+        }
+        #pragma unroll
+        for (int j = 0; j < NR; ++j) {
+            bv[j] = CASE32_GCN_BYTE(b_pack[j], k);
+        }
+        #pragma unroll
+        for (int j = 0; j < NR; ++j) {
+            #pragma unroll
+            for (int i = 0; i < MR; ++i) {
+                acc[j * MR + i] = CASE32_GCN_MAC(av[i], bv[j], acc[j * MR + i]);
+            }
+        }
+    }
+}
+#endif
+#ifndef CASE32_ACC_UNROLL
+#define CASE32_ACC_UNROLL
+#endif
+
+static inline void case32_accum_kgroup(__private int *acc, __private cpm_vec *cpm,
+                                       __private const int *a_pack,
+                                       __private const int *b_pack) {
+#if defined(CASE32_GCN_MAD24)
+    (void)cpm;
+    case32_gcn_kgroup(acc, a_pack, b_pack);
+#elif CASE32_PACKED_DOT
+    (void)cpm;
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        const int base = j * MR;
+        const int b0 = b_pack[j];
+        #pragma unroll
+        for (int i = 0; i < MR; ++i) {
+            acc[base + i] = case32_dot4(acc[base + i], a_pack[i], b0);
+        }
+    }
+#elif CASE32_CPM_INT
+    (void)cpm;
+    case32_cpm_kgroup_direct(acc, a_pack, b_pack);
+#else
+    (void)acc;
+    case32_cpm_kgroup(cpm, a_pack, b_pack);
+#endif
+}
+
+/* One WI's packed-int8 operands for one k-group (RANK=4 bytes per row/col):
+   A: MR*RANK contiguous bytes at tr*KG_BYTES_A, B: NR*RANK bytes at tc*KG_SLICE_B.
+   In the coalesced layout both offsets are multiples of 16 (KG_BYTES_A = MR*4,
+   KG_SLICE_B = NR*4, MR/NR >= 4) on top of 16 KiB kb blocks and 512 B kg strips, so
+   load through 16 B vectors instead of 4 B char4s: the loads are unambiguously
+   dwordx4 even for compilers that do not infer alignment through vload4(char*). */
+#if (MR % 4) == 0 && (NR % 4) == 0 && RANK == 4
+#define CASE32_VEC_LOADS 1
+#else
+#define CASE32_VEC_LOADS 0
+#endif
+
+inline void case32_load_a_pack(__private int *a_pack, __global const char *a_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *a_v = (__global const uint4 *)a_kg;
+    #pragma unroll
+    for (int i = 0; i < MR / 4; ++i) {
+        const uint4 v = a_v[i];
+        a_pack[4 * i + 0] = as_int(v.s0);
+        a_pack[4 * i + 1] = as_int(v.s1);
+        a_pack[4 * i + 2] = as_int(v.s2);
+        a_pack[4 * i + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int i = 0; i < MR; ++i) {
+        a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
+    }
+#endif
+}
+
+inline void case32_load_b_pack(__private int *b_pack, __global const char *b_kg) {
+#if CASE32_VEC_LOADS
+    __global const uint4 *b_v = (__global const uint4 *)b_kg;
+    #pragma unroll
+    for (int j = 0; j < NR / 4; ++j) {
+        const uint4 v = b_v[j];
+        b_pack[4 * j + 0] = as_int(v.s0);
+        b_pack[4 * j + 1] = as_int(v.s1);
+        b_pack[4 * j + 2] = as_int(v.s2);
+        b_pack[4 * j + 3] = as_int(v.s3);
+    }
+#else
+    #pragma unroll
+    for (int j = 0; j < NR; ++j) {
+        b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
+    }
+#endif
+}
+
+#if CASE32_USE_LDS
+/* Case 3.4: all WIs cooperatively copy A/B kg-strips into SLM (coalesced 16B). */
+inline void case32_copy_bytes(__global const uchar *src, __local uchar *dst, int nbytes,
+                              int lid, int lsz) {
+    for (int off = lid * 16; off + 15 < nbytes; off += lsz * 16) {
+        vstore4(vload4(0, src + off), 0, dst + off);
+        vstore4(vload4(0, src + off + 4), 0, dst + off + 4);
+        vstore4(vload4(0, src + off + 8), 0, dst + off + 8);
+        vstore4(vload4(0, src + off + 12), 0, dst + off + 12);
+    }
+    for (int off = (nbytes & ~15) + lid; off < nbytes; off += lsz) {
+        dst[off] = src[off];
+    }
+}
+#endif
+
+#ifdef CASE32_REQD_WG
+/* Host passes the exact launch local size when one macro block fits a work-group. */
+__attribute__((reqd_work_group_size(CASE32_REQD_WG, 1, 1)))
+#endif
+__kernel void case33_macro_gemm_xor(__global const char *a_pre, __global const char *b_pre,
+                                    __global uint *tile_xor, int N, int blocks_k,
+                                    int blocks_per_milestone, int num_milestones, int tile_count,
+                                    int macro_rows, int macro_cols, int xor_after_milestone,
+                                    int mb_begin, int compact_xor, __global const uint *a_key8,
+                                    __global const uint *bound, __global int *found_flag,
+                                    __global int *out_t_rows, __global int *out_t_cols,
+                                    int fuse_jackpot, int micro_m_begin, int micro_m_count) {
+    const int lid = (int)get_local_id(0);
+    const int lsz = (int)get_local_size(0);
+#if !CASE32_USE_LDS
+    if (fuse_jackpot && found_flag != 0 && *found_flag != 0) {
+        return;
+    }
+#endif
+
+    const int mb = mb_begin + (int)get_group_id(0);
+    /* Work-group -> macro block. The linear map (im fastest) makes a 1024-launch
+       walk every im for one jm: each resident work-group streams its own A strip
+       from DRAM and A is never reused from L2 (the whole of A is re-read once per
+       jm). Swizzle into SWZ_IM x SWZ_JM super-tiles (im fastest inside, super-tiles
+       ordered im-fastest too) so the ~30 co-resident work-groups share SWZ_IM A
+       strips and SWZ_JM B strips in L2. Any bijection is correct: t_rows/t_cols and
+       all addressing derive from (im, jm). Falls back to the linear map when the
+       macro grid is not divisible (uniform branch). */
+    int jm;
+    int im;
+    if ((macro_rows % SWZ_IM) == 0 && (macro_cols % SWZ_JM) == 0) {
+        const int super_rows = macro_rows / SWZ_IM;
+        const int super_id = mb / (SWZ_IM * SWZ_JM);
+        const int within = mb - super_id * (SWZ_IM * SWZ_JM);
+        const int super_col = super_id / super_rows;
+        const int super_row = super_id - super_col * super_rows;
+        im = super_row * SWZ_IM + (within % SWZ_IM);
+        jm = super_col * SWZ_JM + (within / SWZ_IM);
+    } else {
+        jm = mb / macro_rows;
+        im = mb - jm * macro_rows;
+    }
+
+    const int tr0 = im * MICRO_M;
+    const int tc0 = jm * MICRO_N;
+    const int hash_tc0 = jm * HASH_MICRO_N;
+
+#if CASE32_WI_ROWMAJOR
+    const int tr_in_slice = lid / HASH_MICRO_N;
+    const int hash_tc = lid % HASH_MICRO_N;
+#else
+    const int tr_in_slice = lid % micro_m_count;
+    const int hash_tc = lid / micro_m_count;
+#endif
+    if (tr_in_slice >= micro_m_count) {
+#if CASE32_USE_LDS
+        /* Padded WIs must still hit barriers; skip GEMM/jackpot via `active`. */
+#else
+        return;
+#endif
+    }
+    const int tr = micro_m_begin + tr_in_slice;
+
+    const int tr_global = tr0 + tr;
+    const int hash_tc_global = hash_tc0 + hash_tc;
+    const int hash_tile_cols = N / HASH_NR;
+    const int hash_spatial_id = tr_global * hash_tile_cols + hash_tc_global;
+
+    uint msg[PP_JACKPOT_WORDS];
+    for (int i = 0; i < PP_JACKPOT_WORDS; ++i) {
+        msg[i] = 0u;
+    }
+#if CASE32_USE_LDS && defined(CASE32_COALESCE)
+    /* Case 3.4: stage full macro kg-strips; every WI participates in the copy. */
+    __local uchar lds_a[KG_LDS_CHUNK * MACRO_KG_STRIP_A];
+    __local uchar lds_b[KG_LDS_CHUNK * MACRO_KG_STRIP_B];
+    const int active = (tr_in_slice < micro_m_count);
+#endif
+    for (int reg_half = 0; reg_half < HASH_REG_TILES_N; ++reg_half) {
+        const int tc = hash_tc * HASH_REG_TILES_N + reg_half;
+        const int tc_global = tc0 + tc;
+        int acc[NR * MR];
+        CASE32_ACC_UNROLL
+        for (int i = 0; i < NR * MR; ++i) {
+            acc[i] = 0;
+        }
+#if CASE32_CPM_PANEL
+        cpm_vec cpm[CPM_NVEC];
+#endif
+#if CASE32_PIPELINE
+        /* Software pipeline (register double buffer). In the coalesced layout a WI's
+           operands for k-group (kb, kg) sit at a_run + (kb*KGROUPS + kg)*MACRO_KG_STRIP_A
+           (same for B), i.e. the whole K walk is one flat stride, so the prefetch runs
+           across kb boundaries and never drains. Buffer 0 holds the k-group being
+           consumed; the loop is unrolled x2 so buffers alternate without copies. */
+        __global const char *a_run =
+                a_pre + (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A +
+                (size_t)tr * (size_t)KG_BYTES_A;
+        __global const char *b_run =
+                b_pre + (size_t)jm * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_B +
+                (size_t)tc * (size_t)KG_SLICE_B;
+        const int kg_last = blocks_k * KGROUPS - 1;
+        int kg_flat = 0;
+        int a_p0[MR];
+        int b_p0[NR];
+        int a_p1[MR];
+        int b_p1[NR];
+        case32_load_a_pack(a_p0, a_run);
+        case32_load_b_pack(b_p0, b_run);
+#endif
+        int ms = 0;
+        for (int kb = 0; kb < blocks_k; ++kb) {
+#if CASE32_CPM_PANEL
+        case32_cpm_zero(cpm);
+#endif
+#if defined(CASE32_COALESCE)
+        const size_t a_kb_base =
+                (size_t)im * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_A +
+                (size_t)kb * (size_t)MACRO_KB_BLOCK_A;
+        const size_t b_kb_base =
+                (size_t)jm * (size_t)blocks_k * (size_t)MACRO_KB_BLOCK_B +
+                (size_t)kb * (size_t)MACRO_KB_BLOCK_B;
+
+#if CASE32_USE_LDS
+        /* Case 3.4 cooperative LDS: all WIs copy A/B strips, then reuse from SLM. */
+        for (int kg0 = 0; kg0 < KGROUPS; kg0 += KG_LDS_CHUNK) {
+            const int nkg = min(KG_LDS_CHUNK, KGROUPS - kg0);
+            const int a_bytes = nkg * MACRO_KG_STRIP_A;
+            const int b_bytes = nkg * MACRO_KG_STRIP_B;
+
+            case32_copy_bytes((__global const uchar *)(a_pre + a_kb_base +
+                                                       (size_t)kg0 * (size_t)MACRO_KG_STRIP_A),
+                              lds_a, a_bytes, lid, lsz);
+            case32_copy_bytes((__global const uchar *)(b_pre + b_kb_base +
+                                                       (size_t)kg0 * (size_t)MACRO_KG_STRIP_B),
+                              lds_b, b_bytes, lid, lsz);
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            if (active) {
+                for (int kgi = 0; kgi < nkg; ++kgi) {
+                    __local const uchar *a_kg =
+                            lds_a + (size_t)kgi * (size_t)MACRO_KG_STRIP_A +
+                            (size_t)tr * (size_t)KG_BYTES_A;
+                    __local const uchar *b_kg =
+                            lds_b + (size_t)kgi * (size_t)MACRO_KG_STRIP_B +
+                            (size_t)tc * (size_t)KG_SLICE_B;
+                    int a_pack[MR];
+                    int b_pack[NR];
+                    #pragma unroll
+                    for (int i = 0; i < MR; ++i) {
+                        a_pack[i] = as_int(vload4(0, a_kg + (size_t)i * RANK));
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < NR; ++j) {
+                        b_pack[j] = as_int(vload4(0, b_kg + (size_t)j * RANK));
+                    }
+#if !CASE32_CPM_PANEL
+                    case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
+#else
+                    case32_accum_kgroup(acc, cpm, a_pack, b_pack);
+#endif
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+#elif CASE32_PIPELINE
+        (void)a_kb_base;
+        (void)b_kb_base;
+        for (int kg = 0; kg < KGROUPS; kg += 2) {
+            /* kg+1 always exists (KGROUPS even); kg+2 may be the next kb's first
+               k-group, clamp at the very end (re-reads the last k-group, harmless). */
+            const int kg_n1 = kg_flat + 1;
+            const int kg_n2 = (kg_flat + 2 <= kg_last) ? (kg_flat + 2) : kg_last;
+            case32_load_a_pack(a_p1, a_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p1, b_run + (size_t)kg_n1 * (size_t)MACRO_KG_STRIP_B);
+#if !CASE32_CPM_PANEL
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p0, b_p0);
+#else
+            case32_accum_kgroup(acc, cpm, a_p0, b_p0);
+#endif
+            case32_load_a_pack(a_p0, a_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_A);
+            case32_load_b_pack(b_p0, b_run + (size_t)kg_n2 * (size_t)MACRO_KG_STRIP_B);
+#if !CASE32_CPM_PANEL
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_p1, b_p1);
+#else
+            case32_accum_kgroup(acc, cpm, a_p1, b_p1);
+#endif
+            kg_flat += 2;
+        }
+#else
+        for (int kg = 0; kg < KGROUPS; ++kg) {
+            __global const char *a_kg =
+                    a_pre + a_kb_base + (size_t)kg * (size_t)MACRO_KG_STRIP_A +
+                    (size_t)tr * (size_t)KG_BYTES_A;
+            __global const char *b_kg =
+                    b_pre + b_kb_base + (size_t)kg * (size_t)MACRO_KG_STRIP_B +
+                    (size_t)tc * (size_t)KG_SLICE_B;
+
+            int a_pack[MR];
+            int b_pack[NR];
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
+#if !CASE32_CPM_PANEL
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
+#else
+            case32_accum_kgroup(acc, cpm, a_pack, b_pack);
+#endif
+        }
+#endif
+#else
+        __global const char *a_tile = a_pre + (size_t)tr_global * (size_t)blocks_k *
+                                              (size_t)PANEL_A +
+                                      (size_t)kb * (size_t)PANEL_A;
+        __global const char *b_tile = b_pre + (size_t)tc_global * (size_t)blocks_k *
+                                              (size_t)PANEL_B +
+                                      (size_t)kb * (size_t)PANEL_B;
+
+        for (int kg = 0; kg < KGROUPS; ++kg) {
+            __global const char *a_kg = a_tile + (size_t)kg * (size_t)KG_BYTES_A;
+            __global const char *b_kg =
+                    b_tile + (size_t)kg * (size_t)KG_SLICE_B;
+            int a_pack[MR];
+            int b_pack[NR];
+            case32_load_a_pack(a_pack, a_kg);
+            case32_load_b_pack(b_pack, b_kg);
+#if !CASE32_CPM_PANEL
+            case32_accum_kgroup(acc, (__private cpm_vec *)0, a_pack, b_pack);
+#else
+            case32_accum_kgroup(acc, cpm, a_pack, b_pack);
+#endif
+        }
+#endif
+#if CASE32_CPM_PANEL
+        case32_cpm_flush(acc, cpm);
+#endif
+        /* One milestone per KR panel (KR == R_RANK). Cumulative acc across kb. */
+        uint x = 0u;
+        if (tr_in_slice < micro_m_count) {
+            CASE32_ACC_UNROLL
+            for (int i = 0; i < NR * MR; ++i) {
+                x ^= as_uint(acc[i]);
+            }
+        }
+        if (tr_in_slice < micro_m_count) {
+            if (xor_after_milestone) {
+                if (fuse_jackpot) {
+                    if (ms < PP_MAX_MILESTONES) {
+                        const int tid = ms % PP_JACKPOT_WORDS;
+                        const uint contribution =
+                                (ms + PP_JACKPOT_WORDS < num_milestones)
+                                        ? pp_rotl32(x, PP_LROT)
+                                        : x;
+                        msg[tid] ^= contribution;
+                    }
+                } else {
+                    ulong out_idx;
+                    if (compact_xor) {
+                        const int hash_local_id =
+                                tr_in_slice * HASH_MICRO_N + hash_tc;
+                        const ulong batch_stride =
+                                (ulong)(micro_m_count * HASH_MICRO_N) *
+                                (ulong)num_milestones;
+                        const ulong out_base = (ulong)get_group_id(0) * batch_stride +
+                                               (ulong)hash_local_id *
+                                                       (ulong)num_milestones;
+                        out_idx = out_base + (ulong)ms;
+                    } else {
+                        out_idx = (ulong)ms * (ulong)tile_count +
+                                  (ulong)hash_spatial_id;
+                    }
+#if HASH_REG_TILES_N > 1
+                    if (reg_half == 0) {
+                        tile_xor[out_idx] = x;
+                    } else {
+                        tile_xor[out_idx] ^= x;
+                    }
+#else
+                    tile_xor[out_idx] = x;
+#endif
+                }
+            }
+        }
+        ++ms;
+        }
+    }
+    (void)blocks_per_milestone;
+
+#if CASE32_USE_LDS
+    if (tr_in_slice >= micro_m_count) {
+        return;
+    }
+#endif
+    if (!fuse_jackpot || !xor_after_milestone || a_key8 == 0 || bound == 0) {
+        return;
+    }
+
+    uint digest[8];
+    b3_compress64(a_key8, msg, digest);
+    if (!digest_beats_target(digest, bound)) {
+        return;
+    }
+
+    if (found_flag == 0) {
+        return;
+    }
+    if (atomic_cmpxchg(found_flag, 0, 1) != 0) {
+        return;
+    }
+
+    const int t_rows = im * MACRO_M + tr * MR;
+    const int t_cols = jm * MACRO_N + hash_tc * HASH_NR;
+    if (out_t_rows != 0) {
+        *out_t_rows = t_rows;
+    }
+    if (out_t_cols != 0) {
+        *out_t_cols = t_cols;
+    }
+}

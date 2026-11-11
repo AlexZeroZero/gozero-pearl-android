@@ -1,0 +1,90 @@
+#ifndef CP_CONFIG_H
+#define CP_CONFIG_H
+
+#define M_DIM  131072
+#define N_DIM  131072
+#define K_DIM  4096
+#define R_RANK 128
+/* Pearl rank-penalty floor / normalization (zk-pow PENALTY_BASE_RANK). */
+#define PENALTY_BASE_RANK 128
+#if R_RANK < PENALTY_BASE_RANK
+#error "R_RANK must be >= PENALTY_BASE_RANK"
+#endif
+#if (K_DIM % R_RANK) != 0
+#error "K_DIM must be a multiple of R_RANK"
+#endif
+
+#define PP_HASH_H 8
+#define PP_HASH_W 16
+
+#define PP_ROW_PERIOD 128
+#define PP_COL_PERIOD 256
+
+/* CUTLASS Case 10 CTA / hash tile (MMA lane 8x8 within 128x128). */
+#define CP_CUTLASS_CTA_M 128
+#define CP_CUTLASS_CTA_N 128
+#define CP_CUTLASS_HASH_H 8
+#define CP_CUTLASS_HASH_W 8
+
+#define INCOMPLETE_HEADER_BYTES 76
+#define HEADER_HEX_LEN (INCOMPLETE_HEADER_BYTES * 2)
+#define TARGET_HEX_LEN 64
+
+#define PLAIN_PROOF_B64_MAX (512 * 1024)
+
+#define CP_PREPACK_TEST_DIM 8192 /* m = n for --prepack-test */
+
+/* --m / --n are in units of CP_MATRIX_UNIT rows (a multiple of every backend tile/macro size).
+ * Caps keep m*K and the hash-tile count (rows/tile * cols/tile) within int range. */
+#define CP_MATRIX_UNIT        1024
+#define CP_MATRIX_UNITS_MAX   256
+#define CP_MATRIX_AREA_MAX    (128 * 128) /* max m_units * n_units */
+/* Hexagon: 128x128 macro blocks per DSP launch, rows and columns (32 x 32 = 4096 x 4096). */
+#define CP_HEXAGON_LAUNCH_MACROS_DEFAULT 32
+/* Intel NPU: 128x128 macro blocks per launch, rows and columns (at most 4 columns). */
+#define CP_INTEL_NPU_ROW_MACROS_DEFAULT 16
+#define CP_INTEL_NPU_COL_MACROS_DEFAULT 4
+
+#define MAX_GPUS 16
+
+/* Job return codes (mine loop). */
+#define CP_PERIOD_BATCH_DEFAULT 1024
+#define CP_PERIOD_BATCH_MAX     1024 /* launch window; scan clips to n/PP_COL_PERIOD */
+#define CP_ROW_PERIOD_BATCH_DEFAULT 32
+#define CP_ROW_PERIOD_BATCH_MAX   1024 /* 131072 rows / 128 rows per period */
+
+/* oneDNN: hash-tile row/col batch per panel (see Case33GemmOnednn scan). */
+#define CP_ONEDNN_PERIOD_BATCH_DEFAULT 256
+/* Systolic (XMX) kernels: 2048x2048 hash tiles per panel (32768^2 GEMM). On an Arc A770
+ * under sustained load the kernel runs 2.2% faster per MAC than with 1024x1024 panels
+ * (fewer kernel tails), and 16 panels per attempt need fewer host syncs than 64. On the
+ * A380, 1024x1024 measured fastest of the sizes up to 1024 (PR #36). */
+#define CP_ONEDNN_SYSTOLIC_BATCH_DEFAULT 2048
+/* dp4a (non-XMX) kernels: 8192x8192 GEMM per panel, i.e. 512x512 hash tiles of 16x16 (256 panels per
+ * 131072^2 attempt). 4096x4096 (256x256 tiles) cost the fused jackpot a host round trip per short panel;
+ * 16384x16384 made the UHD 770 hash rate less steady. */
+#define CP_ONEDNN_DP4A_PANEL_MN 8192
+/* Cards with >= 12 GiB: 4096x4096-tile panels (65536^2 GEMM, 4 per attempt), +0.8% on the A770
+ * (fewer kernel boundaries; idle 2.2 -> 0.4 ms per attempt). */
+#define CP_ONEDNN_SYSTOLIC_BATCH_LARGE_MEM 4096
+/* oneDNN panel batch limit (hash tiles per dimension); larger than the generic launch window. */
+#define CP_ONEDNN_PERIOD_BATCH_MAX 4096
+
+/* OpenCL: macro blocks (128x128) per kernel launch (CUDA contiguous uses 64). */
+#define CP_MACRO_BATCH_DEFAULT 1024 // one full row of 131072 cols
+#define CP_MACRO_BATCH_MAX     1048576
+
+#define CP_JOB_NONE        0
+#define CP_JOB_FEE_SWITCH  1 /* reconnect + re-authorize for developer fee wallet */
+#define CP_JOB_CANCELLED (-1)
+/* Backend or resource failure (OOM, device error, entropy source): the miner exits with
+ * status 1 instead of waiting for the next job, which would only fail the same way. */
+#define CP_JOB_ERROR     (-2)
+
+/* Offline --mock defaults (different difficulty definitions per algo).
+ * Pearl: 2^(256 - D) unscaled target, tile applied once (~few–tens of seconds at --m 8 --n 8).
+ * Quantus: Bitcoin-style U512::MAX / D (~1e6 hashes expected). */
+#define CP_MOCK_DIFF_PEARL_DEFAULT    44.0
+#define CP_MOCK_DIFF_QUANTUS_DEFAULT  1000000.0
+
+#endif /* CP_CONFIG_H */

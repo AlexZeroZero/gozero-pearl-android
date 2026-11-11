@@ -1,0 +1,1158 @@
+cmake_minimum_required(VERSION 3.18)
+
+# Backends (enable independently).
+option(CP_ENABLE_CPU    "Build CPU Case 3.3 worker" ON)
+option(NO_I8MM          "Build without the AArch64 I8MM (smmla) CPU kernel" OFF)
+option(CP_ENABLE_CUDA   "Build CUDA/CUTLASS worker" OFF)
+option(CP_ENABLE_OPENCL "Build OpenCL Case 3.3 worker" OFF)
+option(CP_ENABLE_VULKAN_SCAN "Android packed INT8 scanner with OpenCL noise/witness" OFF)
+option(CP_ENABLE_ONEDNN "Build Intel GPU oneDNN/gemmstone worker" OFF)
+option(CP_ENABLE_WGPU   "Build Quantus wgpu GpuEngine backend (Rust FFI)" OFF)
+option(CP_ENABLE_HEXAGON "Build Pearl Hexagon cDSP (HVX) worker (Android/Linux on Snapdragon)" OFF)
+option(CP_ENABLE_INTEL_NPU "Build Pearl Intel NPU worker (OpenVINO + patched NPU compiler)" OFF)
+option(CP_ENABLE_CUBLAS "Link cuBLAS for --cublas-period debug path" OFF)
+option(CP_CUDA_ARCH     "CUDA arch e.g. 75; empty = native" "")
+# Termux + vendor OpenCL: driver needs /vendor libc++, miner needs Termux libc++.
+# Static libc++ lets LD_LIBRARY_PATH prefer /vendor without breaking the binary.
+option(CP_STATIC_LIBCXX "Statically link libc++ (Termux/vendor OpenCL)" OFF)
+if(NOT CP_STATIC_LIBCXX AND DEFINED ENV{PREFIX} AND
+   ("$ENV{PREFIX}" MATCHES "/com\\.termux/" OR DEFINED ENV{TERMUX_VERSION}))
+    set(CP_STATIC_LIBCXX ON)
+    message(STATUS "Termux detected: enabling CP_STATIC_LIBCXX for vendor OpenCL coexistence")
+endif()
+
+if(CP_ENABLE_CUBLAS AND NOT CP_ENABLE_CUDA)
+    message(FATAL_ERROR "CP_ENABLE_CUBLAS requires CP_ENABLE_CUDA")
+endif()
+
+if(NOT CP_ENABLE_CPU AND NOT CP_ENABLE_CUDA AND NOT CP_ENABLE_OPENCL AND NOT CP_ENABLE_ONEDNN AND NOT CP_ENABLE_WGPU AND NOT CP_ENABLE_HEXAGON AND NOT CP_ENABLE_INTEL_NPU)
+    message(FATAL_ERROR "Enable at least one of CP_ENABLE_CPU, CP_ENABLE_CUDA, CP_ENABLE_OPENCL, CP_ENABLE_ONEDNN, CP_ENABLE_WGPU, CP_ENABLE_HEXAGON, CP_ENABLE_INTEL_NPU")
+endif()
+
+set(_cp_langs CXX C)
+if(CP_ENABLE_CUDA)
+    list(APPEND _cp_langs CUDA)
+endif()
+project(cppminer LANGUAGES ${_cp_langs})
+
+if(MSVC)
+    # Sources are UTF-8 without BOM; otherwise MSVC reads them in the system code page
+    # (e.g. 936 on Chinese Windows) and warns C4819.
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(cp_pool_protocol_test
+        tests/cp_pool_protocol_test.cpp
+        src/common/cp_json_frame.cpp
+        src/common/cp_pool_notify.cpp
+        src/common/cp_util.cpp
+        src/common/cp_state.cpp)
+    target_include_directories(cp_pool_protocol_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(WIN32)
+        target_link_libraries(cp_pool_protocol_test PRIVATE bcrypt ws2_32)
+    endif()
+    add_test(NAME cp_pool_protocol COMMAND cp_pool_protocol_test)
+    add_executable(cp_tcp_test tests/cp_tcp_test.cpp src/common/cp_tcp.cpp)
+    target_include_directories(cp_tcp_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    if(WIN32)
+        target_link_libraries(cp_tcp_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME cp_tcp COMMAND cp_tcp_test)
+    add_executable(cp_cli_test tests/cp_cli_test.cpp)
+    target_include_directories(cp_cli_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME cp_cli COMMAND cp_cli_test)
+    add_executable(cp_opencl_layout_test tests/cp_opencl_layout_test.cpp src/opencl/case32_layout.cpp)
+    target_include_directories(cp_opencl_layout_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src/opencl)
+    add_test(NAME cp_opencl_layout COMMAND cp_opencl_layout_test)
+endif()
+if(CP_ENABLE_CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+endif()
+
+set(CP_COMMON_SOURCES
+    src/common/main.cpp
+    src/common/cp_options.cpp
+    src/common/cp_diagnostics.cpp
+    src/common/cp_backend_setup.cpp
+    src/common/cp_pool_session.cpp
+    src/common/cp_tcp.cpp
+    src/common/cp_util.cpp
+    src/common/cp_json_frame.cpp
+    src/common/cp_pool.cpp
+    src/common/cp_pool_notify.cpp
+    src/common/cp_job_ctrl.cpp
+    src/common/cp_mine.cpp
+    src/common/cp_fee.cpp
+    src/common/cp_algo.cpp
+    src/common/cp_qpow_pool.cpp
+    src/common/cp_qpow_mine.cpp
+    src/common/cp_share_queue.cpp
+    src/common/cp_state.cpp
+    src/common/cp_api.cpp
+    src/common/cp_worker.cpp
+    src/common/cp_noise.c
+    src/qpow/cpu/miner.cpp
+)
+
+set(CP_INCLUDE_DIRS
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/common
+    ${CMAKE_SOURCE_DIR}/src/cpu
+    ${CMAKE_SOURCE_DIR}/src/cuda
+    ${CMAKE_SOURCE_DIR}/src/opencl
+    ${CMAKE_SOURCE_DIR}/src/onednn
+    ${CMAKE_SOURCE_DIR}/src/qpow/wgpu
+    ${CMAKE_SOURCE_DIR}/src/pearl/wgpu
+    ${CMAKE_SOURCE_DIR}/src/pearl/hexagon
+    ${CMAKE_SOURCE_DIR}/src/pearl/intel_npu
+    ${CMAKE_SOURCE_DIR}/src/qpow/opencl
+    ${CMAKE_SOURCE_DIR}/src/qpow/cuda
+    ${CMAKE_SOURCE_DIR}/src/qpow/include
+)
+
+# Quantus Poseidon2 AVX2 TU (x86 only; non-x86 uses scalar stubs in miner.cpp).
+set(CP_QPOW_AVX2_OBJECTS)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    add_library(cp_qpow_avx2 OBJECT src/qpow/cpu/simd_avx2.cpp)
+    target_include_directories(cp_qpow_avx2 PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/qpow/include
+        ${CMAKE_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(cp_qpow_avx2 PRIVATE /O2 /arch:AVX2)
+    else()
+        target_compile_options(cp_qpow_avx2 PRIVATE -O3 -mavx2)
+    endif()
+    list(APPEND CP_QPOW_AVX2_OBJECTS $<TARGET_OBJECTS:cp_qpow_avx2>)
+endif()
+
+# BLAKE3
+set(B3_DIR ${CMAKE_SOURCE_DIR}/third_party/blake3)
+if(NOT EXISTS ${B3_DIR}/blake3.c)
+    message(FATAL_ERROR "Run build.sh (any shell, including MSYS2) or build.ps1 (MSVC) once to fetch BLAKE3, or vendor third_party/blake3")
+endif()
+list(APPEND CP_INCLUDE_DIRS ${B3_DIR})
+
+set(CP_BLAKE3_SOURCES
+    ${B3_DIR}/blake3.c
+    ${B3_DIR}/blake3_dispatch.c
+    ${B3_DIR}/blake3_portable.c
+)
+
+# The Rust proof FFI and the miner both use BLAKE3. On AArch64, build each
+# NEON implementation and namespace the miner's C symbols to avoid collisions.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    list(APPEND CP_BLAKE3_SOURCES ${B3_DIR}/blake3_neon.c)
+    set(CP_BLAKE3_NAMESPACE_DEFINITIONS
+        blake3_version=cp_blake3_version
+        blake3_hasher_init=cp_blake3_hasher_init
+        blake3_hasher_init_keyed=cp_blake3_hasher_init_keyed
+        blake3_hasher_init_derive_key=cp_blake3_hasher_init_derive_key
+        blake3_hasher_init_derive_key_raw=cp_blake3_hasher_init_derive_key_raw
+        blake3_hasher_update=cp_blake3_hasher_update
+        blake3_hasher_finalize=cp_blake3_hasher_finalize
+        blake3_hasher_finalize_seek=cp_blake3_hasher_finalize_seek
+        blake3_hasher_reset=cp_blake3_hasher_reset
+        blake3_compress_in_place=cp_blake3_compress_in_place
+        blake3_compress_subtree_wide=cp_blake3_compress_subtree_wide
+        blake3_compress_xof=cp_blake3_compress_xof
+        blake3_xof_many=cp_blake3_xof_many
+        blake3_hash_many=cp_blake3_hash_many
+        blake3_simd_degree=cp_blake3_simd_degree
+        blake3_compress_in_place_portable=cp_blake3_compress_in_place_portable
+        blake3_compress_xof_portable=cp_blake3_compress_xof_portable
+        blake3_hash_many_portable=cp_blake3_hash_many_portable
+        blake3_hash_many_neon=cp_blake3_hash_many_neon)
+    set_source_files_properties(
+        ${CP_BLAKE3_SOURCES}
+        src/common/cp_noise.c
+        PROPERTIES COMPILE_DEFINITIONS
+            "${CP_BLAKE3_NAMESPACE_DEFINITIONS}")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+    list(APPEND CP_BLAKE3_SOURCES
+        ${B3_DIR}/blake3_sse2.c
+        ${B3_DIR}/blake3_sse41.c
+        ${B3_DIR}/blake3_avx2.c
+        ${B3_DIR}/blake3_avx512.c)
+    if(MSVC)
+        if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+            set_source_files_properties(${B3_DIR}/blake3_sse2.c
+                PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
+        endif()
+        # MSVC has no SSE4.1-specific switch; this is BLAKE3's upstream setting.
+        set_source_files_properties(${B3_DIR}/blake3_sse41.c
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+        set_source_files_properties(${B3_DIR}/blake3_avx2.c
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(${B3_DIR}/blake3_avx512.c
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    else()
+        set_source_files_properties(${B3_DIR}/blake3_sse2.c
+            PROPERTIES COMPILE_OPTIONS "-msse2")
+        set_source_files_properties(${B3_DIR}/blake3_sse41.c
+            PROPERTIES COMPILE_OPTIONS "-msse4.1")
+        set_source_files_properties(${B3_DIR}/blake3_avx2.c
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(${B3_DIR}/blake3_avx512.c
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl")
+    endif()
+endif()
+
+set(CP_SOURCES ${CP_COMMON_SOURCES} ${CP_BLAKE3_SOURCES})
+
+if(CP_ENABLE_CPU)
+    list(APPEND CP_SOURCES
+        src/cpu/cp_cpu_worker.cpp
+        src/cpu/cp_cpu_affinity.cpp
+        src/cpu/gemm/case33_gemm_xor.cpp
+        src/cpu/gemm/case33_cpu_features.cpp
+        src/cpu/gemm/case33_gemm_xor_neon.cpp
+        src/cpu/gemm/case33_gemm_xor_dotprod.cpp
+        src/cpu/gemm/case33_gemm_xor_i8mm.cpp
+    )
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        list(APPEND CP_SOURCES
+            src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
+            src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
+            src/cpu/gemm/case33_gemm_xor_avx2.cpp
+            src/cpu/gemm/case33_gemm_xor_ssse3.cpp)
+        add_compile_definitions(CASE33_BUILD_X86=1)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        add_compile_definitions(CASE33_BUILD_AARCH64=1)
+        if(MSVC)
+            set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:armv8.2")
+            # MSVC has no I8MM switch / intrinsics gate; the TU compiles to a no-op stub.
+        else()
+            set_source_files_properties(src/cpu/gemm/case33_gemm_xor_dotprod.cpp
+                PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+            if(NO_I8MM)
+                message(STATUS "I8MM CPU kernel disabled (NO_I8MM=ON); --simd i8mm is "
+                    "unavailable in this binary")
+            else()
+                # +i8mm needs GCC >= 10 / Clang >= 11; older compilers reject the flag.
+                include(CheckCXXSourceCompiles)
+                set(CMAKE_REQUIRED_FLAGS "-march=armv8.2-a+dotprod+i8mm")
+                check_cxx_source_compiles("
+                    #include <arm_neon.h>
+                    int main() {
+                        int32x4_t acc = vdupq_n_s32(0);
+                        acc = vmmlaq_s32(acc, vdupq_n_s8(1), vdupq_n_s8(1));
+                        return vgetq_lane_s32(acc, 0) == 8 ? 0 : 1;
+                    }" CP_CXX_HAS_I8MM)
+                unset(CMAKE_REQUIRED_FLAGS)
+                if(CP_CXX_HAS_I8MM)
+                    set_source_files_properties(src/cpu/gemm/case33_gemm_xor_i8mm.cpp
+                        PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod+i8mm")
+                    add_compile_definitions(CP_HAVE_I8MM_KERNEL=1)
+                else()
+                    # Retest on the next configure (e.g. after a compiler upgrade).
+                    unset(CP_CXX_HAS_I8MM CACHE)
+                    message(FATAL_ERROR
+                        "The compiler (${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}) "
+                        "cannot build -march=armv8.2-a+dotprod+i8mm (needs GCC >= 10 or "
+                        "Clang >= 11).\n"
+                        "Upgrade the compiler, or reconfigure with -DNO_I8MM=ON to build "
+                        "without the I8MM CPU kernel: the binary will then not have the I8MM "
+                        "path, and CPUs with I8MM will use the slower DotProd kernel.")
+                endif()
+            endif()
+        endif()
+    endif()
+    add_compile_definitions(CP_ENABLE_CPU=1)
+else()
+    add_compile_definitions(CP_ENABLE_CPU=0)
+endif()
+
+if(CP_ENABLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    list(APPEND CP_SOURCES
+        src/cuda/cp_gpu.cu
+        src/cuda/cp_cutlass_gemm.cu
+        src/cuda/cp_cuda_worker.cpp
+        src/qpow/cuda/cp_qpow_cuda.cu
+    )
+    list(APPEND CP_INCLUDE_DIRS
+        ${CMAKE_SOURCE_DIR}/src/cuda/cutlass
+        ${CMAKE_SOURCE_DIR}/third_party/cutlass_override
+        ${CMAKE_SOURCE_DIR}/third_party/cutlass/include
+        ${CMAKE_SOURCE_DIR}/third_party/cutlass/examples/35_gemm_softmax
+    )
+    add_compile_definitions(CP_ENABLE_CUDA=1)
+    if(CP_ENABLE_CUBLAS)
+        add_compile_definitions(CP_ENABLE_CUBLAS=1)
+    else()
+        add_compile_definitions(CP_ENABLE_CUBLAS=0)
+    endif()
+    if(CP_CUDA_ARCH)
+        set(CMAKE_CUDA_ARCHITECTURES ${CP_CUDA_ARCH})
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES native)
+    endif()
+else()
+    add_compile_definitions(CP_ENABLE_CUDA=0 CP_ENABLE_CUBLAS=0)
+endif()
+
+if(CP_ENABLE_OPENCL OR CP_ENABLE_ONEDNN)
+    # Prefer vendored Khronos headers + Windows x64 import lib (no vendor SDK).
+    set(_OCL_HDR "${CMAKE_SOURCE_DIR}/third_party/opencl-headers")
+    set(_OCL_LIB_WIN "${CMAKE_SOURCE_DIR}/third_party/opencl/lib/x64/OpenCL.lib")
+    if(WIN32 AND EXISTS "${_OCL_LIB_WIN}" AND EXISTS "${_OCL_HDR}/CL/cl.h")
+        add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
+        set_target_properties(OpenCL::OpenCL PROPERTIES
+            IMPORTED_LOCATION "${_OCL_LIB_WIN}"
+            INTERFACE_INCLUDE_DIRECTORIES "${_OCL_HDR}")
+        set(OpenCL_FOUND TRUE)
+        message(STATUS "Using vendored OpenCL: ${_OCL_LIB_WIN}")
+    endif()
+    # Termux: prefer vendor GPU libOpenCL over ocl-icd. ocl-icd often reports 0
+    # platforms unless a vendors/*.icd entry + LD_LIBRARY_PATH are set just right.
+    set(_cp_termux_ocl FALSE)
+    if(DEFINED ENV{TERMUX_VERSION} OR
+       (DEFINED ENV{PREFIX} AND "$ENV{PREFIX}" MATCHES "/com\\.termux/"))
+        set(_cp_termux_ocl TRUE)
+    endif()
+    if(NOT OpenCL_FOUND AND _cp_termux_ocl AND EXISTS "${_OCL_HDR}/CL/cl.h")
+        foreach(_ocl_cand
+                "/vendor/lib64/libOpenCL.so"
+                "/vendor/lib/libOpenCL.so"
+                "/system/vendor/lib64/libOpenCL.so"
+                "/system/vendor/lib/libOpenCL.so")
+            if(EXISTS "${_ocl_cand}")
+                add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
+                set_target_properties(OpenCL::OpenCL PROPERTIES
+                    IMPORTED_LOCATION "${_ocl_cand}"
+                    INTERFACE_INCLUDE_DIRECTORIES "${_OCL_HDR}")
+                set(OpenCL_FOUND TRUE)
+                set(OpenCL_LIBRARY "${_ocl_cand}")
+                message(STATUS "Using Android vendor OpenCL: ${_ocl_cand}")
+                message(STATUS "  Run with the same LD_LIBRARY_PATH that makes clinfo work")
+                message(STATUS "  (often /system/lib64:/system_ext/lib64:/vendor/lib64 + SoC/VNDK dirs;")
+                message(STATUS "   see docs/termux_note.md). Requires CP_STATIC_LIBCXX.")
+                break()
+            endif()
+        endforeach()
+        unset(_ocl_cand)
+    endif()
+    if(NOT OpenCL_FOUND)
+        find_package(OpenCL QUIET)
+    endif()
+    if(NOT OpenCL_FOUND AND EXISTS "${_OCL_HDR}/CL/cl.h")
+        find_library(OpenCL_LIBRARY NAMES OpenCL OpenCL.so
+            HINTS "$ENV{PREFIX}/lib")
+        if(OpenCL_LIBRARY)
+            add_library(OpenCL::OpenCL UNKNOWN IMPORTED)
+            set_target_properties(OpenCL::OpenCL PROPERTIES
+                IMPORTED_LOCATION "${OpenCL_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${_OCL_HDR}")
+            set(OpenCL_FOUND TRUE)
+            message(STATUS "Using system OpenCL + vendored headers: ${OpenCL_LIBRARY}")
+            if(_cp_termux_ocl)
+                message(STATUS "  If clGetPlatformIDs returns 0, see docs/termux_note.md (ICD + LD_LIBRARY_PATH)")
+            endif()
+        endif()
+    endif()
+    if(NOT OpenCL_FOUND)
+        find_package(OpenCL REQUIRED)
+    endif()
+    unset(_cp_termux_ocl)
+    if(CP_ENABLE_OPENCL)
+        list(APPEND CP_SOURCES
+            src/opencl/cp_opencl_worker.cpp
+            src/opencl/case33_gemm_ocl.cpp
+            src/opencl/case33_ocl_prep.cpp
+            src/opencl/cp_ocl_align_test.cpp
+            src/opencl/cp_ocl_prep_profile.cpp
+            src/opencl/case32_prepack.cpp
+            src/opencl/case32_layout.cpp
+            src/opencl/opencl_context.cpp
+            src/qpow/opencl/cp_qpow_opencl_worker.cpp
+        )
+        add_compile_definitions(CP_ENABLE_OPENCL=1)
+        if(CP_ENABLE_VULKAN_SCAN)
+            if(NOT ANDROID)
+                message(FATAL_ERROR "CP_ENABLE_VULKAN_SCAN is currently Android only")
+            endif()
+            list(APPEND CP_SOURCES src/opencl/vulkan/pearl_vulkan.cpp)
+            add_compile_definitions(CP_ENABLE_VULKAN_SCAN=1)
+        endif()
+    else()
+        add_compile_definitions(CP_ENABLE_OPENCL=0)
+    endif()
+    set(_CP_NEEDS_OPENCL_LINK TRUE)
+else()
+    add_compile_definitions(CP_ENABLE_OPENCL=0)
+endif()
+
+if(CP_ENABLE_ONEDNN)
+    set(_ONEDNN_DIR "${CMAKE_SOURCE_DIR}/src/onednn")
+    set(_GEMMSTONE_ROOT "${_ONEDNN_DIR}/third_party/gemmstone")
+    set(_ONEDNN_SRC "${CMAKE_SOURCE_DIR}/third_party/onednn-src")
+    set(_ONEDNN_GEMM_JIT "${_ONEDNN_SRC}/src/gpu/intel/gemm/jit")
+    set(_ONEDNN_KERNEL_DB "${_ONEDNN_GEMM_JIT}/selector/db/kernel.db")
+    set(_ONEDNN_PREP_BAT "${_ONEDNN_DIR}/prepare_onednn_deps.bat")
+    set(_ONEDNN_PROBLEM_HPP "${_GEMMSTONE_ROOT}/include/gemmstone/problem.hpp")
+    if(WIN32 AND EXISTS "${_ONEDNN_PREP_BAT}")
+        if(NOT EXISTS "${_ONEDNN_KERNEL_DB}" OR NOT EXISTS "${_GEMMSTONE_ROOT}/include/gemmstone/generator.hpp")
+            message(STATUS "CP_ENABLE_ONEDNN: running prepare_onednn_deps.bat (fetch + patch gemmstone)")
+        else()
+            message(STATUS "CP_ENABLE_ONEDNN: re-applying case5_patches to vendored gemmstone")
+        endif()
+        execute_process(
+            COMMAND cmd /c "${_ONEDNN_PREP_BAT}"
+            WORKING_DIRECTORY "${_ONEDNN_DIR}"
+            RESULT_VARIABLE _ONEDNN_PREP_RC)
+        if(NOT _ONEDNN_PREP_RC EQUAL 0)
+            message(FATAL_ERROR "prepare_onednn_deps.bat failed (exit ${_ONEDNN_PREP_RC})")
+        endif()
+    endif()
+    if(NOT EXISTS "${_ONEDNN_KERNEL_DB}")
+        message(FATAL_ERROR
+            "CP_ENABLE_ONEDNN requires oneDNN sources at third_party/onednn-src "
+            "(missing ${_ONEDNN_KERNEL_DB}). Run src/onednn/prepare_onednn_deps.bat")
+    endif()
+    if(NOT EXISTS "${_ONEDNN_PROBLEM_HPP}")
+        message(FATAL_ERROR
+            "CP_ENABLE_ONEDNN requires vendored gemmstone at ${_GEMMSTONE_ROOT}. "
+            "Run src/onednn/prepare_onednn_deps.bat")
+    endif()
+    file(READ "${_ONEDNN_PROBLEM_HPP}" _ONEDNN_PROBLEM_HPP_CONTENT)
+    if(NOT _ONEDNN_PROBLEM_HPP_CONTENT MATCHES "case5TileXor")
+        message(FATAL_ERROR
+            "Case5 gemmstone patches not applied (case5TileXor missing in problem.hpp). "
+            "From repo root run: src/onednn/prepare_onednn_deps.bat refresh")
+    endif()
+    file(GLOB _GEMMSTONE_PIECE_SOURCES CONFIGURE_DEPENDS
+        "${_GEMMSTONE_ROOT}/generator/pieces/*.cpp")
+    set(_ONEDNN_GEMMSTONE_SOURCES
+        src/onednn/case5_generator.cpp
+        src/onednn/case5_catalog.cpp
+        src/onednn/case5_kernel_select.cpp
+        ${_ONEDNN_GEMM_JIT}/selector/kernel_selector.cpp
+        ${_ONEDNN_GEMM_JIT}/selector/kernel_evaluator.cpp
+        ${_GEMMSTONE_ROOT}/generator/strategy.cpp
+        ${_GEMMSTONE_ROOT}/generator/strategy_parser.cpp
+        ${_GEMMSTONE_PIECE_SOURCES}
+        src/onednn/third_party/ngen/ngen_register_allocator.cpp)
+    list(APPEND CP_SOURCES
+        src/onednn/cp_onednn_worker.cpp
+        src/onednn/case33_gemm_onednn.cpp
+        src/onednn/case5_gemm_launch.cpp
+        src/onednn/case5_ngen_gemm.cpp
+        ${_ONEDNN_GEMMSTONE_SOURCES})
+    if(NOT CP_ENABLE_OPENCL)
+        list(APPEND CP_SOURCES
+            src/opencl/case33_ocl_prep.cpp
+            src/opencl/case32_layout.cpp
+            src/opencl/opencl_context.cpp)
+    endif()
+    list(APPEND CP_INCLUDE_DIRS
+        ${_ONEDNN_DIR}
+        ${_GEMMSTONE_ROOT}
+        ${_GEMMSTONE_ROOT}/include
+        ${_GEMMSTONE_ROOT}/generator
+        ${_ONEDNN_GEMM_JIT}
+        ${_ONEDNN_DIR}/third_party/ngen)
+    add_compile_definitions(CP_ENABLE_ONEDNN=1
+        NGEN_SAFE
+        NGEN_SHORT_NAMES
+        NGEN_LINK_OPENCL
+        NGEN_NO_OP_NAMES
+        NGEN_NAMESPACE=ngen
+        NGEN_CONFIG
+        GEMMSTONE_CONFIG
+        GEMMSTONE_BUILD_12LP
+        _CRT_SECURE_NO_WARNINGS)
+else()
+    add_compile_definitions(CP_ENABLE_ONEDNN=0)
+endif()
+
+if(CP_ENABLE_WGPU)
+    list(APPEND CP_SOURCES
+        src/qpow/wgpu/cp_wgpu_worker.cpp
+        src/pearl/wgpu/cp_pearl_wgpu_worker.cpp)
+    add_compile_definitions(CP_ENABLE_WGPU=1)
+else()
+    add_compile_definitions(CP_ENABLE_WGPU=0)
+endif()
+
+# Hexagon cDSP: the host side needs no SDK (libcdsprpc.so is loaded at run time). The DSP
+# library (libpearlx_skel.so) is built separately with the Hexagon SDK: src/pearl/hexagon/dsp.
+if(CP_ENABLE_HEXAGON)
+    if(WIN32 OR APPLE)
+        message(FATAL_ERROR "CP_ENABLE_HEXAGON targets Android/Linux on Snapdragon")
+    endif()
+    list(APPEND CP_SOURCES
+        src/pearl/hexagon/cp_pearl_hexagon_worker.cpp
+        src/pearl/hexagon/cp_pearlx_client.c)
+    add_compile_definitions(CP_ENABLE_HEXAGON=1)
+else()
+    add_compile_definitions(CP_ENABLE_HEXAGON=0)
+endif()
+
+# Intel NPU: OpenVINO built from source with the patched in-plugin NPU compiler
+# (src/pearl/intel_npu/prepare_intel_npu_deps.ps1 fetches, patches and builds both, and writes
+# third_party/intel_npu/paths.cmake with the OpenVINO build and binary directories).
+if(CP_ENABLE_INTEL_NPU)
+    set(_CP_NPU_DIR "${CMAKE_SOURCE_DIR}/src/pearl/intel_npu")
+    if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/intel_npu/paths.cmake")
+        include("${CMAKE_SOURCE_DIR}/third_party/intel_npu/paths.cmake")
+    endif()
+    set(CP_INTEL_NPU_OPENVINO_DIR "${CP_INTEL_NPU_OPENVINO_DIR}" CACHE PATH
+        "OpenVINO build tree with OpenVINOConfig.cmake (build-x86_64/Release)")
+    set(CP_INTEL_NPU_OPENVINO_BIN_DIR "${CP_INTEL_NPU_OPENVINO_BIN_DIR}" CACHE PATH
+        "OpenVINO runtime binaries (bin/intel64/Release), holding the patched openvino_intel_npu_compiler")
+    if(NOT CP_INTEL_NPU_OPENVINO_DIR)
+        message(FATAL_ERROR "CP_ENABLE_INTEL_NPU needs OpenVINO and the patched NPU compiler. Run "
+            "src/pearl/intel_npu/prepare_intel_npu_deps.ps1 (or pass -DCP_INTEL_NPU_OPENVINO_DIR=<build-x86_64/Release> "
+            "-DCP_INTEL_NPU_OPENVINO_BIN_DIR=<bin/intel64/Release>)")
+    endif()
+    find_package(OpenVINO REQUIRED COMPONENTS Runtime PATHS "${CP_INTEL_NPU_OPENVINO_DIR}" NO_DEFAULT_PATH)
+    list(APPEND CP_SOURCES
+        src/pearl/intel_npu/cp_pearl_npu_worker.cpp
+        src/pearl/intel_npu/cp_npu_engine.cpp
+        src/pearl/intel_npu/cp_npu_graph.cpp)
+    add_compile_definitions(CP_ENABLE_INTEL_NPU=1)
+else()
+    add_compile_definitions(CP_ENABLE_INTEL_NPU=0)
+endif()
+
+add_executable(cppminer ${CP_SOURCES} ${CP_QPOW_AVX2_OBJECTS})
+target_include_directories(cppminer PRIVATE ${CP_INCLUDE_DIRS})
+if(CP_ENABLE_HEXAGON)
+    target_link_libraries(cppminer PRIVATE ${CMAKE_DL_LIBS})
+endif()
+if(CP_ENABLE_INTEL_NPU)
+    target_link_libraries(cppminer PRIVATE openvino::runtime)
+    target_compile_definitions(cppminer PRIVATE "CP_INTEL_NPU_SOURCE_KERNEL_DIR=\"${_CP_NPU_DIR}/kernels\"")
+    # The TileXorAcc SHAVE kernel (prebuilt, see src/pearl/intel_npu/README.md) next to the miner, where
+    # the patched compiler loads it from, and the OpenVINO runtime with the patched compiler.
+    add_custom_command(TARGET cppminer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cppminer>/kernels/intel_npu"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_CP_NPU_DIR}/kernels/tile_xor_acc.3720xx.elf"
+            "${_CP_NPU_DIR}/kernels/tile_xor_acc.3720xx_lsu0_wo.elf"
+            "${_CP_NPU_DIR}/kernels/tile_jackpot.3720xx.elf"
+            "${_CP_NPU_DIR}/kernels/tile_jackpot.3720xx_lsu0_wo.elf"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/intel_npu/"
+        COMMENT "Copy the Intel NPU TileXorAcc and TileJackpot kernels next to cppminer")
+    if(CP_INTEL_NPU_OPENVINO_BIN_DIR)
+        set(_cp_npu_runtime)
+        foreach(_f openvino.dll openvino_intel_npu_plugin.dll openvino_intel_npu_compiler.dll
+                   openvino_intel_npu_compiler_loader.dll tbb12.dll
+                   libopenvino.so libopenvino_intel_npu_plugin.so libopenvino_intel_npu_compiler.so)
+            if(EXISTS "${CP_INTEL_NPU_OPENVINO_BIN_DIR}/${_f}")
+                list(APPEND _cp_npu_runtime "${CP_INTEL_NPU_OPENVINO_BIN_DIR}/${_f}")
+            endif()
+        endforeach()
+        if(_cp_npu_runtime)
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_cp_npu_runtime} "$<TARGET_FILE_DIR:cppminer>/"
+                COMMENT "Copy the OpenVINO runtime and the patched NPU compiler next to cppminer")
+        endif()
+    endif()
+    # Standalone check of one launch against a host reference, and its launch rate.
+    add_executable(cp_npu_launch_test
+        src/pearl/intel_npu/cp_npu_launch_test.cpp
+        src/pearl/intel_npu/cp_npu_engine.cpp
+        src/pearl/intel_npu/cp_npu_graph.cpp)
+    target_include_directories(cp_npu_launch_test PRIVATE ${_CP_NPU_DIR} ${CMAKE_SOURCE_DIR}/src/cpu)
+    target_link_libraries(cp_npu_launch_test PRIVATE openvino::runtime)
+    target_compile_definitions(cp_npu_launch_test PRIVATE "CP_INTEL_NPU_SOURCE_KERNEL_DIR=\"${_CP_NPU_DIR}/kernels\"")
+endif()
+
+if(CP_ENABLE_CUDA)
+    target_link_libraries(cppminer PRIVATE CUDA::cudart)
+    if(CP_ENABLE_CUBLAS)
+        target_link_libraries(cppminer PRIVATE CUDA::cublas)
+    endif()
+endif()
+
+if(CP_ENABLE_OPENCL)
+    target_link_libraries(cppminer PRIVATE OpenCL::OpenCL)
+    if(CP_ENABLE_VULKAN_SCAN)
+        target_link_libraries(cppminer PRIVATE vulkan)
+    endif()
+    add_custom_command(TARGET cppminer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cppminer>/kernels"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/case33_gemm_xor.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/case33_gemm_xor.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_blake3.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_blake3.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_merkle.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_merkle.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/qpow/opencl/kernels/qpow_mining.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/qpow_mining.cl"
+        COMMENT "Copy OpenCL kernels next to cppminer")
+    if(CP_ENABLE_ONEDNN)
+        add_custom_command(TARGET cppminer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_onednn_jackpot.cl"
+                "$<TARGET_FILE_DIR:cppminer>/kernels/cp_onednn_jackpot.cl"
+            COMMENT "Copy oneDNN jackpot kernel next to cppminer")
+    endif()
+elseif(CP_ENABLE_ONEDNN)
+    target_link_libraries(cppminer PRIVATE OpenCL::OpenCL)
+    add_custom_command(TARGET cppminer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cppminer>/kernels"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_blake3.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_blake3.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_merkle.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_merkle.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_ocl_prep.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_ocl_prep.cl"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/opencl/kernels/cp_onednn_jackpot.cl"
+            "$<TARGET_FILE_DIR:cppminer>/kernels/cp_onednn_jackpot.cl"
+        COMMENT "Copy OpenCL prep kernels next to cppminer")
+endif()
+
+# Optional in-process proof FFI via cargo (CMake builds it; falls back to stub).
+# CP_PROOF_FFI=OFF forces the stub, e.g. for a cross build where cargo cannot
+# target the device (-DCARGO_EXECUTABLE=...-NOTFOUND does not stick: find_program
+# re-searches a NOTFOUND cache entry on every reconfigure).
+option(CP_PROOF_FFI "Build and link the Rust proof FFI (needs cargo for the target)" ON)
+set(CP_PROOF_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-proof-ffi)
+set(CP_PROOF_FFI_MANIFEST ${CP_PROOF_FFI_DIR}/Cargo.toml)
+find_program(CARGO_EXECUTABLE cargo
+    HINTS
+        "$ENV{HOME}/.cargo/bin"
+        "$ENV{USERPROFILE}/.cargo/bin"
+        "$ENV{CARGO_HOME}/bin"
+        "$ENV{CONDA_PREFIX}/bin"
+        "$ENV{CONDA_PREFIX}/Library/bin"
+        "$ENV{CONDA_PREFIX}/Scripts"
+)
+
+set(_cp_proof_deps_ok TRUE)
+foreach(_dep
+        ${CMAKE_SOURCE_DIR}/third_party/pearl-blake3/Cargo.toml
+        ${CMAKE_SOURCE_DIR}/third_party/zk-pow/Cargo.toml
+        ${CMAKE_SOURCE_DIR}/third_party/plonky2/plonky2/Cargo.toml)
+    if(NOT EXISTS ${_dep})
+        set(_cp_proof_deps_ok FALSE)
+    endif()
+endforeach()
+
+# Match CMAKE_BUILD_TYPE when set; default Release (multi-config / empty type).
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_cp_cargo_args build)
+    set(_cp_cargo_profile debug)
+else()
+    set(_cp_cargo_args build --release)
+    set(_cp_cargo_profile release)
+endif()
+set(_cp_cargo_out ${CP_PROOF_FFI_DIR}/target/${_cp_cargo_profile})
+set(_cp_cargo_env CARGO_TARGET_DIR=${CP_PROOF_FFI_DIR}/target)
+# Android cross-builds (NDK toolchain file): build the crate for the Android target, with
+# the NDK's clang and llvm-ar for any C code in its dependencies. Needs that target's Rust
+# standard library (rustup target add aarch64-linux-android, or conda-forge's
+# rust-std-aarch64-linux-android at the rustc version); without it, use the proof stub.
+# The archive then lands in target/<triple>/, apart from any host build's.
+# A native build in Termux also sets ANDROID but has no ANDROID_ABI; its cargo already
+# targets the device, so it takes the host path.
+set(_cp_rust_target "")
+set(_cp_rust_target_ok TRUE)
+if(ANDROID AND CMAKE_CROSSCOMPILING)
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        set(_cp_rust_target aarch64-linux-android)
+    elseif(ANDROID_ABI STREQUAL "x86_64")
+        set(_cp_rust_target x86_64-linux-android)
+    else()
+        message(FATAL_ERROR "cp-proof-ffi: no Rust target for ANDROID_ABI ${ANDROID_ABI}")
+    endif()
+    string(REPLACE "-" "_" _cp_rust_target_env ${_cp_rust_target})
+    list(APPEND _cp_cargo_args --target ${_cp_rust_target})
+    set(_cp_cargo_out ${CP_PROOF_FFI_DIR}/target/${_cp_rust_target}/${_cp_cargo_profile})
+    list(APPEND _cp_cargo_env
+        CC_${_cp_rust_target_env}=${CMAKE_C_COMPILER}
+        CFLAGS_${_cp_rust_target_env}=--target=${CMAKE_C_COMPILER_TARGET}
+        AR_${_cp_rust_target_env}=${CMAKE_AR})
+    if(CP_PROOF_FFI AND CARGO_EXECUTABLE)
+        get_filename_component(_cp_cargo_dir ${CARGO_EXECUTABLE} DIRECTORY)
+        find_program(RUSTC_EXECUTABLE rustc HINTS ${_cp_cargo_dir} NO_DEFAULT_PATH)
+        find_program(RUSTC_EXECUTABLE rustc)
+        set(_cp_rust_sysroot "")
+        if(RUSTC_EXECUTABLE)
+            execute_process(COMMAND ${RUSTC_EXECUTABLE} --print sysroot
+                OUTPUT_VARIABLE _cp_rust_sysroot OUTPUT_STRIP_TRAILING_WHITESPACE
+                ENCODING UTF-8 ERROR_QUIET)
+        endif()
+        if(NOT IS_DIRECTORY "${_cp_rust_sysroot}/lib/rustlib/${_cp_rust_target}")
+            set(_cp_rust_target_ok FALSE)
+            message(WARNING "cp_proof_ffi: Rust has no ${_cp_rust_target} standard library "
+                "(rustup target add ${_cp_rust_target}, or conda-forge "
+                "rust-std-${_cp_rust_target}), so cargo cannot build the proof FFI")
+        endif()
+    endif()
+endif()
+# The name depends on the toolchain, not the OS: an MSVC-targeting cargo emits
+# cp_proof_ffi.lib, while a MinGW-targeting one emits libcp_proof_ffi.a. Keying
+# this off WIN32 broke the MinGW/MSYS2 build, which is still Windows.
+if(MSVC)
+    set(_cp_proof_lib ${_cp_cargo_out}/cp_proof_ffi.lib)
+else()
+    set(_cp_proof_lib ${_cp_cargo_out}/libcp_proof_ffi.a)
+endif()
+
+set(_cp_link_proof_ffi FALSE)
+if(CP_PROOF_FFI AND CARGO_EXECUTABLE AND _cp_rust_target_ok AND _cp_proof_deps_ok
+   AND EXISTS ${CP_PROOF_FFI_MANIFEST})
+    file(GLOB _cp_proof_rs CONFIGURE_DEPENDS
+        ${CP_PROOF_FFI_DIR}/src/*.rs)
+    add_custom_command(
+        OUTPUT ${_cp_proof_lib}
+        COMMAND ${CMAKE_COMMAND} -E env
+            ${_cp_cargo_env}
+            ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+            --manifest-path ${CP_PROOF_FFI_MANIFEST}
+        WORKING_DIRECTORY ${CP_PROOF_FFI_DIR}
+        DEPENDS
+            ${CP_PROOF_FFI_MANIFEST}
+            ${CP_PROOF_FFI_DIR}/Cargo.lock
+            ${_cp_proof_rs}
+            ${CMAKE_SOURCE_DIR}/third_party/pearl-blake3/Cargo.toml
+            ${CMAKE_SOURCE_DIR}/third_party/zk-pow/Cargo.toml
+            ${CMAKE_SOURCE_DIR}/third_party/plonky2/plonky2/Cargo.toml
+        COMMENT "Building cp-proof-ffi (cargo ${_cp_cargo_profile})"
+        VERBATIM
+        USES_TERMINAL
+    )
+    add_custom_target(cp_proof_ffi_build DEPENDS ${_cp_proof_lib})
+    add_dependencies(cppminer cp_proof_ffi_build)
+    set(_cp_link_proof_ffi TRUE)
+    message(STATUS "cp_proof_ffi: cargo will build ${_cp_proof_lib}")
+elseif(CP_PROOF_FFI AND EXISTS ${_cp_proof_lib} AND (NOT CMAKE_CROSSCOMPILING OR _cp_rust_target))
+    # build.ps1 / build.sh may prebuild the crate when cmake cannot find cargo.
+    # Not when cross-compiling to a target without its own directory: the
+    # archive in target/release/ was built for the host, and lld only reports
+    # "archive member is neither ET_REL nor LLVM bitcode" at link time.
+    set(_cp_link_proof_ffi TRUE)
+    message(STATUS "cp_proof_ffi: linking prebuilt ${_cp_proof_lib}")
+else()
+    if(NOT CP_PROOF_FFI)
+        message(STATUS "cp_proof_ffi: disabled (CP_PROOF_FFI=OFF); using proof stub")
+    elseif(NOT _cp_rust_target_ok)
+        message(WARNING "cp_proof_ffi: no ${_cp_rust_target} build; using proof stub "
+            "(no share submit proofs)")
+    elseif(NOT CARGO_EXECUTABLE)
+        message(WARNING "cargo not found; using proof stub (no share submit proofs)")
+    elseif(NOT _cp_proof_deps_ok)
+        message(WARNING "pearl-blake3/zk-pow/plonky2 missing; using proof stub")
+    else()
+        message(WARNING "cp-proof-ffi manifest missing; using proof stub")
+    endif()
+    target_sources(cppminer PRIVATE src/common/cp_proof_stub.cpp)
+endif()
+
+if(ANDROID AND NOT _cp_link_proof_ffi)
+    message(FATAL_ERROR "Gozero Android requires the real proof builder and verifier; no stub builds")
+endif()
+if(ANDROID)
+    target_compile_definitions(cppminer PRIVATE GOZERO_MOBILE=1)
+endif()
+if(_cp_link_proof_ffi)
+    # C++ directly references cp_proof_build/cp_proof_verify. Normal archive linking pulls
+    # their FFI object without force-loading Rust's bundled BLAKE3 objects, which would clash
+    # with the C BLAKE3 implementation used by the miner on ELF linkers.
+    target_link_libraries(cppminer PRIVATE ${_cp_proof_lib})
+    if(WIN32)
+        target_link_libraries(cppminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
+    elseif(APPLE)
+        target_link_libraries(cppminer PRIVATE
+            pthread dl m
+            "-framework Security"
+            "-framework CoreFoundation"
+            "-framework SystemConfiguration")
+    elseif(ANDROID AND CMAKE_CROSSCOMPILING)
+        # pthread is part of Android's libc; Rust's std also needs liblog and libunwind.
+        target_link_libraries(cppminer PRIVATE dl log unwind m)
+    else()
+        target_link_libraries(cppminer PRIVATE pthread dl m)
+    endif()
+endif()
+
+# Quantus wgpu GpuEngine FFI (cdylib preferred: bundles wgpu/DX12/Vulkan deps).
+if(CP_ENABLE_WGPU)
+    set(CP_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-quantus-wgpu-ffi)
+    set(CP_WGPU_FFI_MANIFEST ${CP_WGPU_FFI_DIR}/Cargo.toml)
+    set(_cp_engine_gpu ${CMAKE_SOURCE_DIR}/third_party/quantus-miner/crates/engine-gpu/Cargo.toml)
+    if(WIN32)
+        if(MSVC)
+            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.dll.lib)
+        else()
+            set(_cp_wgpu_implib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.dll.a)
+        endif()
+        set(_cp_wgpu_dll ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.dll)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_quantus_wgpu_ffi.lib)
+    else()
+        set(_cp_wgpu_so ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.so)
+        set(_cp_wgpu_dylib ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.dylib)
+        set(_cp_wgpu_static ${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_quantus_wgpu_ffi.a)
+    endif()
+
+    set(_cp_link_wgpu_ffi FALSE)
+    set(_cp_wgpu_use_stub FALSE)
+    if(CARGO_EXECUTABLE AND EXISTS ${CP_WGPU_FFI_MANIFEST} AND EXISTS ${_cp_engine_gpu})
+        file(GLOB _cp_wgpu_rs CONFIGURE_DEPENDS ${CP_WGPU_FFI_DIR}/src/*.rs)
+        if(WIN32)
+            set(_cp_wgpu_build_out ${_cp_wgpu_implib})
+        elseif(APPLE)
+            set(_cp_wgpu_build_out ${_cp_wgpu_dylib})
+        else()
+            set(_cp_wgpu_build_out ${_cp_wgpu_so})
+        endif()
+        add_custom_command(
+            OUTPUT ${_cp_wgpu_build_out}
+            COMMAND ${CMAKE_COMMAND} -E env
+                CARGO_TARGET_DIR=${CP_WGPU_FFI_DIR}/target
+                ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+                --manifest-path ${CP_WGPU_FFI_MANIFEST}
+            WORKING_DIRECTORY ${CP_WGPU_FFI_DIR}
+            DEPENDS
+                ${CP_WGPU_FFI_MANIFEST}
+                ${CP_WGPU_FFI_DIR}/Cargo.lock
+                ${_cp_wgpu_rs}
+                ${_cp_engine_gpu}
+            COMMENT "Building cp-quantus-wgpu-ffi (cargo ${_cp_cargo_profile})"
+            VERBATIM
+            USES_TERMINAL
+        )
+        add_custom_target(cp_quantus_wgpu_ffi_build DEPENDS ${_cp_wgpu_build_out})
+        add_dependencies(cppminer cp_quantus_wgpu_ffi_build)
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_quantus_wgpu_ffi: cargo will build ${_cp_wgpu_build_out}")
+    elseif(WIN32 AND EXISTS ${_cp_wgpu_implib})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_implib}")
+    elseif(APPLE AND EXISTS ${_cp_wgpu_dylib})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_dylib}")
+    elseif(NOT WIN32 AND NOT APPLE AND EXISTS ${_cp_wgpu_so})
+        set(_cp_link_wgpu_ffi TRUE)
+        message(STATUS "cp_quantus_wgpu_ffi: linking prebuilt ${_cp_wgpu_so}")
+    else()
+        set(_cp_wgpu_use_stub TRUE)
+        if(NOT CARGO_EXECUTABLE)
+            message(WARNING "cargo not found; wgpu stub (init will fail)")
+        elseif(NOT EXISTS ${_cp_engine_gpu})
+            message(WARNING "third_party/quantus-miner missing; wgpu stub (run build.ps1/build.sh -Backend Wgpu)")
+        else()
+            message(WARNING "cp-quantus-wgpu-ffi unavailable; wgpu stub")
+        endif()
+        target_sources(cppminer PRIVATE src/qpow/wgpu/cp_wgpu_stub.cpp)
+    endif()
+
+    if(_cp_link_wgpu_ffi AND NOT _cp_wgpu_use_stub)
+        if(WIN32)
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_implib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_quantus_wgpu_ffi.dll"
+                COMMENT "Copy cp_quantus_wgpu_ffi.dll next to cppminer")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE userenv ws2_32 bcrypt ntdll advapi32)
+            endif()
+        elseif(APPLE)
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_dylib})
+            set_target_properties(cppminer PROPERTIES
+                BUILD_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}"
+                INSTALL_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE
+                    pthread dl m
+                    "-framework Security"
+                    "-framework CoreFoundation"
+                    "-framework SystemConfiguration"
+                    "-framework Metal"
+                    "-framework QuartzCore")
+            else()
+                target_link_libraries(cppminer PRIVATE
+                    "-framework Metal"
+                    "-framework QuartzCore")
+            endif()
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_quantus_wgpu_ffi.dylib"
+                COMMENT "Copy libcp_quantus_wgpu_ffi.dylib next to cppminer")
+        else()
+            target_link_libraries(cppminer PRIVATE ${_cp_wgpu_so})
+            set_target_properties(cppminer PROPERTIES
+                BUILD_RPATH "${CP_WGPU_FFI_DIR}/target/${_cp_cargo_profile}"
+                INSTALL_RPATH "\$ORIGIN")
+            if(NOT _cp_link_proof_ffi)
+                target_link_libraries(cppminer PRIVATE pthread dl m)
+            endif()
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_quantus_wgpu_ffi.so"
+                COMMENT "Copy libcp_quantus_wgpu_ffi.so next to cppminer")
+        endif()
+    endif()
+
+    # Pearl wgpu FFI (separate crate from Quantus).
+    set(CP_PEARL_WGPU_FFI_DIR ${CMAKE_SOURCE_DIR}/rust/cp-pearl-wgpu-ffi)
+    set(CP_PEARL_WGPU_FFI_MANIFEST ${CP_PEARL_WGPU_FFI_DIR}/Cargo.toml)
+    if(WIN32)
+        if(MSVC)
+            set(_cp_pearl_wgpu_implib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll.lib)
+        else()
+            set(_cp_pearl_wgpu_implib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.dll.a)
+        endif()
+        set(_cp_pearl_wgpu_dll ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/cp_pearl_wgpu_ffi.dll)
+    else()
+        set(_cp_pearl_wgpu_so ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.so)
+        set(_cp_pearl_wgpu_dylib ${CP_PEARL_WGPU_FFI_DIR}/target/${_cp_cargo_profile}/libcp_pearl_wgpu_ffi.dylib)
+    endif()
+    set(_cp_link_pearl_wgpu_ffi FALSE)
+    if(CARGO_EXECUTABLE AND EXISTS ${CP_PEARL_WGPU_FFI_MANIFEST})
+        file(GLOB _cp_pearl_wgpu_rs CONFIGURE_DEPENDS ${CP_PEARL_WGPU_FFI_DIR}/src/*.rs)
+        file(GLOB _cp_pearl_wgpu_shaders CONFIGURE_DEPENDS
+            ${CMAKE_SOURCE_DIR}/src/pearl/wgpu/kernels/*.wgsl)
+        if(WIN32)
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_implib})
+        elseif(APPLE)
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_dylib})
+        else()
+            set(_cp_pearl_wgpu_build_out ${_cp_pearl_wgpu_so})
+        endif()
+        add_custom_command(
+            OUTPUT ${_cp_pearl_wgpu_build_out}
+            COMMAND ${CMAKE_COMMAND} -E env
+                CARGO_TARGET_DIR=${CP_PEARL_WGPU_FFI_DIR}/target
+                ${CARGO_EXECUTABLE} ${_cp_cargo_args}
+                --manifest-path ${CP_PEARL_WGPU_FFI_MANIFEST}
+            WORKING_DIRECTORY ${CP_PEARL_WGPU_FFI_DIR}
+            DEPENDS
+                ${CP_PEARL_WGPU_FFI_MANIFEST}
+                ${_cp_pearl_wgpu_rs}
+                ${_cp_pearl_wgpu_shaders}
+            COMMENT "Building cp-pearl-wgpu-ffi (cargo ${_cp_cargo_profile})"
+            VERBATIM
+            USES_TERMINAL
+        )
+        add_custom_target(cp_pearl_wgpu_ffi_build DEPENDS ${_cp_pearl_wgpu_build_out})
+        add_dependencies(cppminer cp_pearl_wgpu_ffi_build)
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: cargo will build ${_cp_pearl_wgpu_build_out}")
+    elseif(WIN32 AND EXISTS ${_cp_pearl_wgpu_implib})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_implib}")
+    elseif(APPLE AND EXISTS ${_cp_pearl_wgpu_dylib})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_dylib}")
+    elseif(NOT WIN32 AND NOT APPLE AND EXISTS ${_cp_pearl_wgpu_so})
+        set(_cp_link_pearl_wgpu_ffi TRUE)
+        message(STATUS "cp_pearl_wgpu_ffi: linking prebuilt ${_cp_pearl_wgpu_so}")
+    else()
+        message(WARNING "cp-pearl-wgpu-ffi unavailable; pearl --backend wgpu will fail at init")
+    endif()
+
+    if(_cp_link_pearl_wgpu_ffi)
+        if(WIN32)
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_implib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_dll}" "$<TARGET_FILE_DIR:cppminer>/cp_pearl_wgpu_ffi.dll"
+                COMMENT "Copy cp_pearl_wgpu_ffi.dll next to cppminer")
+        elseif(APPLE)
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_dylib})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_dylib}" "$<TARGET_FILE_DIR:cppminer>/libcp_pearl_wgpu_ffi.dylib"
+                COMMENT "Copy libcp_pearl_wgpu_ffi.dylib next to cppminer")
+        else()
+            target_link_libraries(cppminer PRIVATE ${_cp_pearl_wgpu_so})
+            add_custom_command(TARGET cppminer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_cp_pearl_wgpu_so}" "$<TARGET_FILE_DIR:cppminer>/libcp_pearl_wgpu_ffi.so"
+                COMMENT "Copy libcp_pearl_wgpu_ffi.so next to cppminer")
+        endif()
+    endif()
+endif()
+
+if(MSVC)
+    target_compile_options(cppminer PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/openmp>
+        $<$<COMPILE_LANGUAGE:C>:/openmp>
+    )
+    if(CP_ENABLE_ONEDNN)
+        set_source_files_properties(
+            src/onednn/case5_generator.cpp
+            src/onednn/case5_ngen_gemm.cpp
+            src/onednn/case5_kernel_select.cpp
+            PROPERTIES COMPILE_OPTIONS "/bigobj;/Zm200")
+        target_link_options(cppminer PRIVATE /STACK:8388608)
+    endif()
+    # AVX2 / AVX-VNNI only in dedicated x86 ukernel translation units.
+    if(CP_ENABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_ssse3.cpp
+            PROPERTIES COMPILE_OPTIONS "-mssse3")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
+            PROPERTIES
+                COMPILE_OPTIONS "/arch:AVX2"
+                COMPILE_DEFINITIONS "__AVXVNNI__")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+
+    endif()
+else()
+    # Apple Clang has no built-in OpenMP; use Homebrew libomp when present.
+    if(APPLE AND NOT OpenMP_ROOT AND NOT DEFINED ENV{OpenMP_ROOT})
+        foreach(_omp_prefix /usr/local/opt/libomp /opt/homebrew/opt/libomp)
+            if(EXISTS "${_omp_prefix}/lib/libomp.dylib")
+                set(OpenMP_ROOT "${_omp_prefix}")
+                break()
+            endif()
+        endforeach()
+        unset(_omp_prefix)
+    endif()
+    if(APPLE AND OpenMP_ROOT AND NOT OpenMP_CXX_FOUND)
+        # AppleClang needs -Xpreprocessor; plain -fopenmp is rejected.
+        set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp -I${OpenMP_ROOT}/include" CACHE STRING "" FORCE)
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${OpenMP_ROOT}/include" CACHE STRING "" FORCE)
+        set(OpenMP_C_LIB_NAMES "omp" CACHE STRING "" FORCE)
+        set(OpenMP_CXX_LIB_NAMES "omp" CACHE STRING "" FORCE)
+        set(OpenMP_omp_LIBRARY "${OpenMP_ROOT}/lib/libomp.dylib" CACHE FILEPATH "" FORCE)
+    endif()
+    if(MINGW)
+        # FindOpenMP picks libgomp.dll.a, an import library, which keeps the
+        # exe bound to libgomp-1.dll even under -static (see the MINGW block
+        # below). Point it at the static archive instead.
+        get_filename_component(_cp_gcc_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        find_library(_cp_gomp_static NAMES libgomp.a
+            HINTS "${_cp_gcc_bin}/../lib")
+        unset(_cp_gcc_bin)
+        if(_cp_gomp_static)
+            set(OpenMP_gomp_LIBRARY "${_cp_gomp_static}" CACHE FILEPATH "" FORCE)
+        endif()
+        unset(_cp_gomp_static)
+    endif()
+    if(ANDROID AND CMAKE_CROSSCOMPILING)
+        # NDK cross-builds: FindOpenMP picks the NDK's libomp.so, which Android's linker only
+        # finds through LD_LIBRARY_PATH (it never looks next to the executable). Link the
+        # NDK's libomp.a instead so the miner runs on its own.
+        execute_process(
+            COMMAND ${CMAKE_CXX_COMPILER} --target=${CMAKE_CXX_COMPILER_TARGET}
+                    -print-file-name=libomp.a
+            OUTPUT_VARIABLE _cp_omp_static OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(IS_ABSOLUTE "${_cp_omp_static}" AND EXISTS "${_cp_omp_static}")
+            set(OpenMP_omp_LIBRARY "${_cp_omp_static}" CACHE FILEPATH "" FORCE)
+        endif()
+        unset(_cp_omp_static)
+    endif()
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(cppminer PRIVATE OpenMP::OpenMP_CXX)
+    elseif(NOT APPLE)
+        # GNU/Clang on Linux/etc.: -fopenmp is usually enough.
+        target_compile_options(cppminer PRIVATE -fopenmp)
+        target_link_options(cppminer PRIVATE -fopenmp)
+    else()
+        message(FATAL_ERROR
+            "OpenMP not found (required for CPU build on macOS).\n"
+            "  brew install libomp\n"
+            "  Then reconfigure, or pass -DOpenMP_ROOT=$(brew --prefix libomp)")
+    endif()
+    if(CP_ENABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_ssse3.cpp
+            PROPERTIES COMPILE_OPTIONS "-mssse3")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avxvnni.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-mavxvnni")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512vnni.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni")
+        set_source_files_properties(src/cpu/gemm/case33_gemm_xor_avx512bw.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl")
+    endif()
+endif()
+
+if(WIN32)
+    target_link_libraries(cppminer PRIVATE ws2_32)
+endif()
+
+if(MINGW)
+    # Embed libstdc++, libgcc, libwinpthread and libgomp. A MinGW exe that
+    # imports libstdc++-6.dll takes the first one on PATH, and other
+    # toolchains ship their own (Git for Windows' /mingw64/bin, for one).
+    # A DLL from a different GCC has a different std::locale/ios layout, and
+    # the first iostream use then crashes in std::locale::operator=. The
+    # OpenCL worker hit exactly that while reading its kernel source. The
+    # import libraries (OpenCL, ws2_32, ...) are archives and still link.
+    target_link_options(cppminer PRIVATE -static)
+endif()
+
+if(CP_STATIC_LIBCXX AND NOT MSVC)
+    # Embed libc++ so /vendor/lib64 on LD_LIBRARY_PATH (needed by Adreno/Mali
+    # OpenCL ICDs) cannot replace Termux's libc++_shared at process start.
+    #
+    # Termux: -static-libstdc++ still emits -lc++_shared and fails (no static
+    # lib in $PREFIX/lib). Use ndk-multilib's libc++_static.a + libc++abi.a.
+    set(_cp_libcxx_hints)
+    if(DEFINED ENV{PREFIX})
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+            list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/aarch64-linux-android/lib")
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(armv7|armv7l|arm)$")
+            list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/arm-linux-androideabi/lib")
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+            list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/x86_64-linux-android/lib")
+        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(i[3-6]86|x86)$")
+            list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/i686-linux-android/lib")
+        endif()
+        list(APPEND _cp_libcxx_hints "$ENV{PREFIX}/lib")
+    endif()
+    find_library(CP_LIBCXX_STATIC NAMES c++_static libc++_static
+        HINTS ${_cp_libcxx_hints} NO_DEFAULT_PATH)
+    find_library(CP_LIBCXXABI_STATIC NAMES c++abi libc++abi
+        HINTS ${_cp_libcxx_hints} NO_DEFAULT_PATH)
+    if(NOT CP_LIBCXX_STATIC)
+        find_library(CP_LIBCXX_STATIC NAMES c++_static libc++_static
+            HINTS ${_cp_libcxx_hints})
+    endif()
+    if(NOT CP_LIBCXXABI_STATIC)
+        find_library(CP_LIBCXXABI_STATIC NAMES c++abi libc++abi
+            HINTS ${_cp_libcxx_hints})
+    endif()
+    if(CP_LIBCXX_STATIC AND CP_LIBCXXABI_STATIC)
+        target_link_options(cppminer PRIVATE -nostdlib++)
+        target_link_libraries(cppminer PRIVATE
+            ${CP_LIBCXX_STATIC} ${CP_LIBCXXABI_STATIC})
+        find_library(CP_LIBUNWIND_STATIC NAMES unwind
+            HINTS ${_cp_libcxx_hints})
+        if(CP_LIBUNWIND_STATIC)
+            target_link_libraries(cppminer PRIVATE ${CP_LIBUNWIND_STATIC})
+        endif()
+        message(STATUS "Linking libc++ statically: ${CP_LIBCXX_STATIC}")
+    elseif(DEFINED ENV{TERMUX_VERSION} OR
+           (DEFINED ENV{PREFIX} AND "$ENV{PREFIX}" MATCHES "/com\\.termux/"))
+        message(FATAL_ERROR
+            "CP_STATIC_LIBCXX requires static libc++ on Termux.\n"
+            "  pkg install ndk-multilib\n"
+            "  Then reconfigure, or pass -DCP_STATIC_LIBCXX=OFF")
+    else()
+        # Desktop clang/gcc often supports this; Termux does not without ndk-multilib.
+        target_link_options(cppminer PRIVATE -static-libstdc++)
+        message(STATUS "Linking libc++ via -static-libstdc++ (no libc++_static.a found)")
+    endif()
+    unset(_cp_libcxx_hints)
+endif()
+
+message(STATUS "CPPminer backends: CPU=${CP_ENABLE_CPU} CUDA=${CP_ENABLE_CUDA} OpenCL=${CP_ENABLE_OPENCL} OneDNN=${CP_ENABLE_ONEDNN} WGPU=${CP_ENABLE_WGPU} HEXAGON=${CP_ENABLE_HEXAGON} INTEL_NPU=${CP_ENABLE_INTEL_NPU} CUBLAS=${CP_ENABLE_CUBLAS}")
